@@ -1,4 +1,5 @@
 package kv 
+
 import (
 	"encoding/binary"
 	"io"
@@ -37,7 +38,7 @@ func(ent *Entry) Encode() []byte {
 // io.Reader is for input
 // io.Writer is the corresponding output interface. 
 func (ent *Entry) Decode(r io.Reader) error {
-	header := make([]byte, 8)
+	header := make([]byte, 9) // FIXED: Must be 9 to hold the deleted flag
 	if _, err := io.ReadFull(r, header); err != nil {
 		return err 
 	}
@@ -69,7 +70,7 @@ func (ent *Entry) Decode(r io.Reader) error {
 // 3. DATABASE ENGINE INTEGRATION
 // ============================================================================
 
-type Log Struct {
+type Log struct { // FIXED: Lowercase 's'
 	FileName string
 	fp *os.File // provides methods for file operations (Read, Write, Close)
 }
@@ -79,7 +80,7 @@ func (log *Log) Open() (err error) {
 	// OpenFile returns two: *osFile and error.
 	// O_RDWR: Opens the file for reading and writing.
 	// O_CREATE: Create the file if it doesn't exist yet. 
-	log.fp, err = os.OpenFile(log.Filename, os.O_RDWR|os.O_CREATE, Oo644)
+	log.fp, err = os.OpenFile(log.FileName, os.O_RDWR|os.O_CREATE, 0o644) // FIXED: log.FileName and 0o644
 	return err
 }
 
@@ -93,7 +94,7 @@ func (log *Log) Write(ent *Entry) error {
 	return err
 }
 
-func (log *Log) Read(ent *Entry) (eof bol, err error) {
+func (log *Log) Read(ent *Entry) (eof bool, err error) { // FIXED: bool
 	err = ent.Decode(log.fp)
 	
 	if err == io.EOF { // 1. Decode found zero bytes so reached to eof.
@@ -111,10 +112,31 @@ type KV struct {
 }
 
 func (kv *KV) Open() error {
-	if err := kv.log().Open(); err != nil {
+	if err := kv.log.Open(); err != nil { // FIXED: removed parentheses
 		return err
 	}
-	kv.mem = map[string][]byte{} // empty
+	
+	kv.mem = make(map[string][]byte) // empty
+
+	// FIXED: Added the missing recovery loop!
+	for {
+		ent := &Entry{}
+		eof, err := kv.log.Read(ent)
+		if err != nil {
+			return err
+		}
+		if eof {
+			break
+		}
+
+		keyStr := string(ent.key)
+		if ent.deleted {
+			delete(kv.mem, keyStr)
+		} else {
+			kv.mem[keyStr] = ent.val
+		}
+	}
+
 	return nil
 }
 
@@ -164,6 +186,3 @@ func (kv *KV) Del(key []byte) (deleted bool, err error) {
 
 	return deleted, nil
 }
-
-
-
