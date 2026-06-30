@@ -2,83 +2,117 @@ package kv
 
 import (
 	"bytes"
+	"os"
 	"testing"
 )
 
-// 1. Testing the Integer logic (Ensuring negative numbers survive the binary round-trip)
-func TestCellEncodeDecode_I64(t *testing.T) {
-	original := &Cell{Type: TypeI64, I64: -999}
+// ============================================================================
+// TEST 1: The 9-Byte Binary Serialization
+// ============================================================================
+func TestEncodeDecode(t *testing.T) {
+	ent := &Entry{
+		key:     []byte("test_key"),
+		val:     []byte("test_value"),
+		deleted: true, 
+	}
 
-	// Encode it. Passing 'nil' tells append to just create a new slice.
-	buffer := original.Encode(nil)
-
-	decoded := &Cell{Type: TypeI64}
-	rest, err := decoded.Decode(buffer)
+	encodedBytes := ent.Encode()
+	buf := bytes.NewBuffer(encodedBytes)
+	
+	decodedEnt := &Entry{}
+	err := decodedEnt.Decode(buf)
 
 	if err != nil {
-		t.Fatalf("Failed to decode I64: %v", err)
+		t.Fatalf("Decode failed: %v", err)
 	}
-	// The rest slice should be completely empty if we bit off exactly 8 bytes
-	if len(rest) != 0 {
-		t.Fatalf("Expected empty rest buffer, got %d bytes left over", len(rest))
+
+	if string(decodedEnt.key) != "test_key" {
+		t.Errorf("Expected key 'test_key', got '%s'", string(decodedEnt.key))
 	}
-	// Did -999 survive?
-	if decoded.I64 != original.I64 {
-		t.Fatalf("Expected %d, got %d", original.I64, decoded.I64)
+	if string(decodedEnt.val) != "test_value" {
+		t.Errorf("Expected val 'test_value', got '%s'", string(decodedEnt.val))
+	}
+	if decodedEnt.deleted != true {
+		t.Errorf("Expected deleted to be true, got false")
 	}
 }
 
-// 2. Testing the String logic (Ensuring the 4-byte header works)
-func TestCellEncodeDecode_Str(t *testing.T) {
-	original := &Cell{Type: TypeStr, Str: []byte("Database Engineering")}
+// ============================================================================
+// TEST 2: Disk Logging and Crash Recovery (Now with Fsync!)
+// ============================================================================
+func TestKVRecovery(t *testing.T) {
+	fileName := "test_recovery.log"
+	defer os.Remove(fileName) 
+
+	// --- PHASE 1: Normal Database Operation ---
+	db1 := &KV{log: Log{FileName: fileName}}
+	if err := db1.Open(); err != nil {
+		t.Fatalf("Failed to open db1: %v", err)
+	}
+
+	db1.Set([]byte("user1"), []byte("Morgan"))
+	db1.Set([]byte("user2"), []byte("Alice"))
+	db1.Set([]byte("user1"), []byte("Morgan Kim")) 
+	db1.Del([]byte("user2"))                       
+
+	db1.Close() 
+
+	// --- PHASE 2: Reboot and Recover ---
+	db2 := &KV{log: Log{FileName: fileName}}
 	
-	buffer := original.Encode(nil)
+	if err := db2.Open(); err != nil {
+		t.Fatalf("Failed to open db2: %v", err)
+	}
 
-	decoded := &Cell{Type: TypeStr}
-	rest, err := decoded.Decode(buffer)
+	if val, ok := db2.mem["user1"]; !ok || string(val) != "Morgan Kim" {
+		t.Errorf("Recovery failed for user1. Expected 'Morgan Kim', got '%s'", string(val))
+	}
 
-	if err != nil {
-		t.Fatalf("Failed to decode Str: %v", err)
+	if _, ok := db2.mem["user2"]; ok {
+		t.Errorf("Recovery failed for user2. It should have been deleted, but was found in RAM.")
 	}
-	if len(rest) != 0 {
-		t.Fatalf("Expected empty rest buffer, got %d bytes left over", len(rest))
-	}
-	// bytes.Equal safely compares two byte slices
-	if !bytes.Equal(decoded.Str, original.Str) {
-		t.Fatalf("Expected %s, got %s", string(original.Str), string(decoded.Str))
-	}
+
+	db2.Close()
 }
 
-// 3. Testing the actual Database Row scenario (Chaining them together)
-func TestRowBuffer(t *testing.T) {
-	// Simulate a database row: Column 1 is an Int, Column 2 is a String
-	col1 := &Cell{Type: TypeI64, I64: 42}
-	col2 := &Cell{Type: TypeStr, Str: []byte("Cat")}
-
-	// ENCODE PHASE: Pack them into a single, continuous tape
-	rowBuffer := make([]byte, 0)
-	rowBuffer = col1.Encode(rowBuffer) // Ribbon is now 8 bytes
-	rowBuffer = col2.Encode(rowBuffer) // Ribbon is now 15 bytes (8 + 4 + 3)
-
-	// DECODE PHASE: Unpack them sequentially using the "rest" leftovers
-	readCol1 := &Cell{Type: TypeI64}
-	leftovers, err1 := readCol1.Decode(rowBuffer)
-
-	readCol2 := &Cell{Type: TypeStr}
-	finalRest, err2 := readCol2.Decode(leftovers)
-
-	// Verify nothing crashed
-	if err1 != nil || err2 != nil {
-		t.Fatalf("Crashed during sequential decoding")
-	}
+func TestTornWriteRecovery(t *testing.T) {
+	// 1. Setup a temporary test file
+	os.Remove("test_torn_write.db")
+	kv := &KV{log: Log{FileName: "test_torn_write.db"}}
 	
-	// Verify the data matches exactly
-	if readCol1.I64 != 42 || string(readCol2.Str) != "Cat" {
-		t.Fatalf("Data corruption during sequential decode!")
+	err := kv.Open()
+	if err != nil {
+		t.Fatalf("Failed to open DB: %v", err)
 	}
+
+	// 2. Write a perfectly valid record
+	kv.Set([]byte("key1"), []byte("value1"))
+	kv.Close()
+
+	// 3. THE SABOTAGE: Simulate a torn write by appending 5 garbage bytes directly to the file
+	file, err := os.OpenFile("test_torn_write.db", os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatalf("Failed to open file for sabotage: %v", err)
+	}
+	// Writing 5 bytes. A real header needs 13. This will trigger io.ErrUnexpectedEOF!
+	file.Write([]byte{0xDE, 0xAD, 0xBE, 0xEF, 0x00}) 
+	file.Close()
+
+	// 4. THE RECOVERY: Reboot the database
+	kv2 := &KV{log: Log{FileName: "test_torn_write.db"}}
+	err = kv2.Open()
 	
-	// Verify the entire tape was consumed
-	if len(finalRest) != 0 {
-		t.Fatalf("Expected tape to be empty, but bytes were left behind!")
+	// If our Log.Read() didn't catch the error, err would not be nil and the DB would crash!
+	if err != nil {
+		t.Fatalf("Database crashed during recovery of a torn write! Error: %v", err)
 	}
+
+	// 5. THE VERIFICATION: Did it successfully load the valid record and drop the garbage?
+	val, exists := kv2.mem["key1"]
+	if !exists || string(val) != "value1" {
+		t.Fatalf("Failed to recover valid record after a torn write.")
+	}
+
+	kv2.Close()
+	os.Remove("test_torn_write.db")
 }

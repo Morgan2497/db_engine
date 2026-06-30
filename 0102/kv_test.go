@@ -1,44 +1,47 @@
-package kv 
+
+package db0102
 
 import (
 	"bytes"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
-func TestEntrySerialization(t *testing.T) {
-	original := &Entry {
-		key: []byte("a"),
-		val: []byte("bb"),
-	}
-	
-	// encode key and val
-	encoded := original.Encode()
-	
-	expectedBytes := []byte{1,0,0,0,2,0,0,0,'a','b','b'}
+func TestKVBasic(t *testing.T) {
+	kv := KV{}
+	err := kv.Open()
+	assert.Nil(t, err)
+	defer kv.Close()
 
-	if !bytes.Equal(encoded, expectedBytes) {
-		t.Fatalf("Encode failed!/nExpected: %v\nGot:		%v", expectedBytes, encoded)
-	}
-	
-	// decode testing.
-	// bytes.NewReader takes our raw byte array and turns it into an io.Reader stream.
-	// Like an open file on a hard drive, waiting to be read.
-	reader := bytes.NewReader(encoded)
+	updated, err := kv.Set([]byte("k1"), []byte("v1"))
+	assert.True(t, updated && err == nil)
 
-	// an empty array to get the decoded output.
-	decoded := &Entry{}
-	
-	decodedError := decoded.Decode(reader)
+	val, ok, err := kv.Get([]byte("k1"))
+	assert.True(t, string(val) == "v1" && ok && err == nil)
 
-	if decodedError != nil {
-		t.Fatalf("Decode crahsed with an unexpected error: %v", decodedError)
-	}
+	_, ok, err = kv.Get([]byte("xxx"))
+	assert.True(t, !ok && err == nil)
 
-	if !bytes.Equal(decoded.key, original.key) {
-		t.Errorf("Key mismatch! Expected %s, but got %s", original.key, decoded.key)
-	}
+	updated, err = kv.Del([]byte("xxx"))
+	assert.True(t, !updated && err == nil)
 
-	if !bytes.Equal(decoded.val, original.val) {
-		t.Errorf("Value mismatch! Expected %s, but got %s", original.val, decoded.val)
-	}
+	updated, err = kv.Del([]byte("k1"))
+	assert.True(t, updated && err == nil)
+
+	_, ok, err = kv.Get([]byte("xxx"))
+	assert.True(t, !ok && err == nil)
 }
+
+func TestEntryEncode(t *testing.T) {
+	ent := Entry{key: []byte("k1"), val: []byte("xxx")}
+	data := []byte{2, 0, 0, 0, 3, 0, 0, 0, 'k', '1', 'x', 'x', 'x'}
+
+	assert.Equal(t, data, ent.Encode())
+
+	decoded := Entry{}
+	err := decoded.Decode(bytes.NewBuffer(data))
+	assert.Nil(t, err)
+	assert.Equal(t, ent, decoded)
+}
+// QzBQWVJJOUhU https://trialofcode.org/

@@ -1,4 +1,6 @@
-package kv 
+//go:build unix
+
+package db0105
 
 import (
 	"os"
@@ -7,23 +9,14 @@ import (
 )
 
 // syncDir forces the OS to flush the directory metadata to the physical disk.
-// This ensures that if we create a new file, its existence is permanently recorded.
-
 func syncDir(file string) error {
-	// O_RDONLY: this flag is used to open() system call to specify that a file should be
-	// opened for reading only. 
-	// O_DIRECTORY: this flag tells the kernel that the target path must be a directory 
-	// it it is a regular file, the call fails with ENOTDIR.
-	// Return a single integer a bitmask of flags. 
 	flags := os.O_RDONLY | syscall.O_DIRECTORY 
-	
 	dirfd, err := syscall.Open(path.Dir(file), flags, 0o644)
 	if err != nil {
 		return err 
 	}
-	defer syscall.Close(dirfd) // schedules a function call to be executed immediately before the surrounding function returns.
+	defer syscall.Close(dirfd)
 	return syscall.Fsync(dirfd)
-
 }
 
 func createFileSync(file string) (*os.File, error) {
