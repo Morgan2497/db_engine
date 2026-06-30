@@ -1,4 +1,4 @@
-package db0105
+package kv
 
 import (
 	"encoding/binary"
@@ -14,7 +14,11 @@ type Entry struct {
 }
 
 func (ent *Entry) Encode() []byte {
-	data := make([]byte, 4+4+4+1+len(ent.key)+len(ent.val))
+	valLen := len(ent.val)
+	if ent.deleted {
+		valLen = 0
+	}
+	data := make([]byte, 4+4+4+1+len(ent.key)+valLen)
 	binary.LittleEndian.PutUint32(data[4:8], uint32(len(ent.key)))
 	copy(data[4+4+4+1:], ent.key)
 	if ent.deleted {

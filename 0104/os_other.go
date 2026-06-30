@@ -1,6 +1,6 @@
 //go:build !unix
 
-package db0104
+package kv
 
 import "os"
 

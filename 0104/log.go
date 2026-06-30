@@ -11,7 +11,7 @@ type Log struct {
 }
 
 func (log *Log) Open() (err error) {
-	log.fp, err = os.OpenFile(log.FileName, os.O_RDWR|os.O_CREATE, 0o644)
+	log.fp, err = createFileSync(log.FileName)
 	return err
 }
 
@@ -20,8 +20,10 @@ func (log *Log) Close() error {
 }
 
 func (log *Log) Write(ent *Entry) error {
-	_, err := log.fp.Write(ent.Encode())
-	return err
+	if _, err := log.fp.Write(ent.Encode()); err != nil {
+		return err
+	}
+	return log.fp.Sync()
 }
 
 func (log *Log) Read(ent *Entry) (eof bool, err error) {

@@ -1,6 +1,6 @@
 //go:build unix
 
-package db0104
+package kv
 
 import (
 	"os"
@@ -13,7 +13,7 @@ func createFileSync(file string) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err = syncDir(path.Base(file)); err != nil {
+	if err = syncDir(file); err != nil {
 		_ = fp.Close()
 		return nil, err
 	}
