@@ -4,45 +4,40 @@ import (
 	"bytes"
 	"path/filepath"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestKVBasic(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "basic.log")
 	db := &KV{log: Log{FileName: path}}
-	if err := db.Open(); err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	assert.NoError(t, db.Open())
 	defer db.Close()
 
 	updated, err := db.Set([]byte("morgankim"), []byte("developer"))
-	if err != nil || !updated {
-		t.Fatalf("Set new key: updated=%v err=%v", updated, err)
-	}
+	assert.NoError(t, err)
+	assert.True(t, updated)
 
 	updated, err = db.Set([]byte("morgankim"), []byte("developer"))
-	if err != nil || updated {
-		t.Fatalf("Set duplicate: updated=%v err=%v", updated, err)
-	}
+	assert.NoError(t, err)
+	assert.False(t, updated)
 
 	val, ok, err := db.Get([]byte("morgankim"))
-	if err != nil || !ok || !bytes.Equal(val, []byte("developer")) {
-		t.Fatalf("Get: ok=%v err=%v val=%q", ok, err, val)
-	}
+	assert.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, []byte("developer"), val)
 
 	deleted, err := db.Del([]byte("morgankim"))
-	if err != nil || !deleted {
-		t.Fatalf("Del existing: deleted=%v err=%v", deleted, err)
-	}
+	assert.NoError(t, err)
+	assert.True(t, deleted)
 
 	_, ok, err = db.Get([]byte("morgankim"))
-	if err != nil || ok {
-		t.Fatalf("Get after delete: ok=%v err=%v", ok, err)
-	}
+	assert.NoError(t, err)
+	assert.False(t, ok)
 
 	deleted, err = db.Del([]byte("missing"))
-	if err != nil || deleted {
-		t.Fatalf("Del missing: deleted=%v err=%v", deleted, err)
-	}
+	assert.NoError(t, err)
+	assert.False(t, deleted)
 }
 
 func TestEntryEncodeDecode(t *testing.T) {
@@ -55,17 +50,13 @@ func TestEntryEncodeDecode(t *testing.T) {
 	}
 
 	got := ent.Encode()
-	if !bytes.Equal(got, want) {
-		t.Fatalf("Encode:\ngot  %v\nwant %v", got, want)
-	}
+	assert.Equal(t, want, got)
 
 	var decoded Entry
-	if err := decoded.Decode(bytes.NewReader(got)); err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	if !bytes.Equal(decoded.key, ent.key) || !bytes.Equal(decoded.val, ent.val) || decoded.deleted {
-		t.Fatalf("roundtrip mismatch")
-	}
+	assert.NoError(t, decoded.Decode(bytes.NewReader(got)))
+	assert.Equal(t, ent.key, decoded.key)
+	assert.Equal(t, ent.val, decoded.val)
+	assert.False(t, decoded.deleted)
 }
 
 func TestEntryTombstone(t *testing.T) {
@@ -73,62 +64,48 @@ func TestEntryTombstone(t *testing.T) {
 	got := ent.Encode()
 
 	var decoded Entry
-	if err := decoded.Decode(bytes.NewReader(got)); err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	if !bytes.Equal(decoded.key, ent.key) || !decoded.deleted {
-		t.Fatalf("tombstone mismatch")
-	}
+	assert.NoError(t, decoded.Decode(bytes.NewReader(got)))
+	assert.Equal(t, ent.key, decoded.key)
+	assert.True(t, decoded.deleted)
 }
 
 func TestKVRecovery(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.log")
 
 	db1 := &KV{log: Log{FileName: path}}
-	if err := db1.Open(); err != nil {
-		t.Fatalf("open db1: %v", err)
-	}
+	assert.NoError(t, db1.Open())
 
-	if _, err := db1.Set([]byte("user1"), []byte("Morgan")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db1.Set([]byte("user2"), []byte("Alice")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db1.Set([]byte("user1"), []byte("Morgan Kim")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db1.Del([]byte("user2")); err != nil {
-		t.Fatal(err)
-	}
-	if err := db1.Close(); err != nil {
-		t.Fatal(err)
-	}
+	_, err := db1.Set([]byte("user1"), []byte("Morgan"))
+	assert.NoError(t, err)
+	_, err = db1.Set([]byte("user2"), []byte("Alice"))
+	assert.NoError(t, err)
+	_, err = db1.Set([]byte("user1"), []byte("Morgan Kim"))
+	assert.NoError(t, err)
+	_, err = db1.Del([]byte("user2"))
+	assert.NoError(t, err)
+	assert.NoError(t, db1.Close())
 
 	db2 := &KV{log: Log{FileName: path}}
-	if err := db2.Open(); err != nil {
-		t.Fatalf("open db2: %v", err)
-	}
+	assert.NoError(t, db2.Open())
 	defer db2.Close()
 
 	val, ok, err := db2.Get([]byte("user1"))
-	if err != nil || !ok || string(val) != "Morgan Kim" {
-		t.Fatalf("user1: ok=%v err=%v val=%q", ok, err, val)
-	}
-	if _, ok, err := db2.Get([]byte("user2")); err != nil || ok {
-		t.Fatalf("user2 should be deleted: ok=%v err=%v", ok, err)
-	}
+	assert.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, "Morgan Kim", string(val))
+
+	_, ok, err = db2.Get([]byte("user2"))
+	assert.NoError(t, err)
+	assert.False(t, ok)
 }
 
 func TestEmptyLogOpen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "empty.log")
 	db := &KV{log: Log{FileName: path}}
-	if err := db.Open(); err != nil {
-		t.Fatal(err)
-	}
+	assert.NoError(t, db.Open())
 	defer db.Close()
 
-	if _, ok, err := db.Get([]byte("missing")); err != nil || ok {
-		t.Fatalf("expected missing key: ok=%v err=%v", ok, err)
-	}
+	_, ok, err := db.Get([]byte("missing"))
+	assert.NoError(t, err)
+	assert.False(t, ok)
 }
