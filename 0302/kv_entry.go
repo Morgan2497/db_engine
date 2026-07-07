@@ -1,3 +1,18 @@
+// 0102: Serialization
+// To store data types from a programming language on disk or send them over a network,
+// they must be converted into a byte sequence which is called "Serialization"
+// This is the process of flattening a complex, living data structure from your programming
+// language into a single, continuous stream of raw binary bytes ([]byte).
+//
+// In step 0101, our key-value store lived entirely in computer's RAM. RAM is fast
+// but RAM is volatile, the second the program exits, terminal closes, the data inside
+// kv.mem disappears.
+// To make our database durable, the data must be written to Non-Volatile Storage
+// (SSD or Hard Drive).
+//
+// 0105: CRC32 checksum prepended for atomicity (13-byte header).
+// | crc32 | key size | val size | deleted | key data | val data |
+
 package kv
 
 import (
@@ -8,11 +23,14 @@ import (
 )
 
 type Entry struct {
-	key     []byte
-	val     []byte
+	key []byte
+	val []byte
+	// deleting a key in RAM was easy. However, on a phyiscal disk log,
+	// you cannot go back, find the key and delete as it only moves forward.
 	deleted bool
 }
 
+// 1. Serialization
 func (ent *Entry) Encode() []byte {
 	valLen := len(ent.val)
 	if ent.deleted {
@@ -33,6 +51,7 @@ func (ent *Entry) Encode() []byte {
 
 var ErrBadSum = errors.New("bad checksum")
 
+// 2. Deserialization
 func (ent *Entry) Decode(r io.Reader) error {
 	var header [4 + 4 + 4 + 1]byte
 	if _, err := io.ReadFull(r, header[:]); err != nil {
