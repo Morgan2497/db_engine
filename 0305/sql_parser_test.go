@@ -55,12 +55,12 @@ func TestParseEqual(t *testing.T) {
 func testParseSelect(t *testing.T, s string, ref StmtSelect) {
 	t.Helper()
 	p := NewParser(s)
-	out := StmtSelect{}
-	err := p.parseSelect(&out)
-	
+	stmt, err := p.parseStmt()
 	assert.NoError(t, err)
+	out, ok := stmt.(*StmtSelect)
+	assert.True(t, ok)
 	assert.True(t, p.isEnd(), "Expected parser to reach the end of the string")
-	assert.Equal(t, ref, out)
+	assert.Equal(t, ref, *out)
 }
 
 func TestParseSelect(t *testing.T) {

@@ -1,36 +1,48 @@
 # Chapter 0305: Execute SQL
 
 ## Systems Engineering Overview
+We are building the **Query Execution Engine**—the traffic controller of our database. Until now, we could parse queries (understand the command) and store data (write to disk). This new execution layer connects the two. 
 
-At this stage in the engine's lifecycle, we are constructing the **Query Execution Engine**—the critical middleware that bridges the frontend parsing phase with the backend storage engine. Prior to this chapter, the system possessed a raw Key-Value storage layer and a recursive descent parser that produced Abstract Syntax Trees (ASTs). The execution layer acts as a command multiplexer, decoupling the logical intent of a query from its physical implementation.
-
-The primary entry point is the router mechanism (`ExecStmt`), which consumes a typed AST node (e.g., `*StmtSelect`, `*StmtInsert`) and delegates it to the appropriate execution pipeline. To ensure a uniform database API, all pipelines collapse their outputs into a single, standardized I/O boundary: the `SQLResult` struct. This unified data structure elegantly handles both scalar mutations (tracking the integer count of affected rows for DML operations) and vector/matrix retrievals (returning the header and row data for DQL operations), abstracting the underlying storage mechanics away from the client caller.
+The main router, `ExecStmt`, looks at a parsed query (like a `SELECT` or `INSERT`) and sends it to the correct execution pipeline. No matter what the operation is, the result is always handed back to the user in a single, standardized package called `SQLResult`. This keeps our database API completely unified.
 
 ## Architecture
+The execution layer relies on two main mechanisms to process queries:
 
-The execution layer is heavily dependent on a dual-tier metadata architecture and distinct execution pipelines.
+* **The Schema Registry (Metadata):** Before doing anything, the engine needs to know what the tables look like. 
+    * **Disk (Durable):** Schemas are saved permanently as JSON in the Key-Value store under a special `@schema_` prefix so they survive reboots.
+    * **RAM Cache (Volatile):** Reading from disk every time is too slow. We keep a fast copy of accessed schemas in memory (`tables map[string]Schema`) so future queries are practically instant.
+* **Execution Pipelines:** * **Create (DDL):** Builds a new schema and saves it to both disk and the RAM cache.
+    * **Select (DQL):** Finds the exact primary key, fetches the physical row, and slices off only the specific columns the user asked for.
+    * **Insert/Update/Delete (DML):** Modifies the exact physical bytes on the disk and returns the number of rows that were successfully changed.
 
-### The Schema Registry (Metadata Layer)
-All relational operations depend on table schemas to map logical columns to physical byte offsets. The engine introduces a schema registry with two distinct layers:
-* **Durable Storage (Disk/KV):** Schemas are serialized into JSON and stored durably in the underlying Key-Value engine using a reserved namespace prefix (`@schema_` + table name). This ensures metadata persists across database restarts.
-* **Volatile Storage (RAM Cache):** To prevent severe I/O bottlenecks where every query requires a disk read to fetch schema metadata, the `DB` struct implements a memory-resident cache (`tables map[string]Schema`). This cache lazily populates on the first query to a table and serves all subsequent requests directly from RAM.
+### 1. DDL (Data Definition Language)
+**Purpose:** Defines the physical rules, schemas, and structural blueprints of the database.
+* **Operations:** `CREATE TABLE`
+* **Pipeline Mechanics:** When a DDL statement is executed, the engine allocates physical indices for the requested columns and establishes the primary key constraints. This blueprint (the Schema) is serialized into JSON and written to the durable KV store using a metadata prefix (e.g., `@schema_tablename`). It is simultaneously cached in a RAM map to ensure zero-latency schema lookups during future read/write operations.
 
-### Execution Pipelines
-The multiplexer routes AST nodes into three primary operational pipelines:
-* **DDL Pipeline (Create):** Transforms the `StmtCreatTable` AST into a physical `Schema` object, serializes it, persists it to the KV store, and actively populates the RAM cache.
-* **DQL Pipeline (Select):** A multi-stage retrieval and filtering pipeline. It resolves requested column names to schema indices (`lookupColumns`), builds a physical lookup key from the `WHERE` clause (`makePKey`), executes the physical KV `Select`, and finally slices the retrieved data to match the requested projection (`subsetRow`).
-* **DML Pipeline (Insert, Update, Delete):** Maps AST values to physical rows and invokes the previously established backend storage routines (`DB.Insert`, `DB.Update`, `DB.Delete`), returning the mutation count to populate the `SQLResult`.
+### 2. DML (Data Manipulation Language)
+**Purpose:** Modifies the physical user data stored within the tables.
+* **Operations:** `INSERT`, `UPDATE`, `DELETE`
+* **Pipeline Mechanics:** DML acts as a strict memory formatter and mutation layer.
+    * **INSERT:** Operates as a linear safety checkpoint. It assumes the parser has aligned the input, verifies column counts, enforces strict type safety against the schema, allocates a physical memory slice, and delegates to the KV engine to encode the slice into raw `[]byte` sequences for the physical disk log.
+    * **UPDATE:** Executes a strict "Read-Modify-Write" cycle. It translates the `WHERE` clause into a physical disk address, fetches and decodes the existing byte array, applies mutations in RAM (while actively blocking any attempts to modify primary key indices), and overwrites the sequence on disk.
+    * **DELETE:** Formats the target constraint into a physical primary key and executes a "tombstone" write. It appends a marker to the physical disk log indicating the record is deleted and instantly purges the key from the fast-access RAM map.
+
+### 3. DQL (Data Query Language)
+**Purpose:** Retrieves and reshapes data from the database without altering the state.
+* **Operations:** `SELECT`
+* **Pipeline Mechanics:** DQL acts as the ultimate translator between the user's abstract projection requests and the physical hardware. It fetches the schema blueprint, converts requested column strings into exact integer memory offsets, and translates the `WHERE` clause into a physical key for the KV lookup. Once the physical byte array is fetched and decoded from the disk, the engine meticulously slices off any unrequested column data, returning a perfectly trimmed 2D matrix back to the client.
 
 ## CPU/Memory Layout
-
-The implementation of the execution layer introduces new memory lifecycle considerations for the engine:
-
-* **The Cache Map (`tables map[string]Schema`):** This introduces a persistent memory footprint. While a single schema is lightweight, holding all accessed schemas in heap memory trades RAM for CPU/IO efficiency. Because schemas are relatively static, cache invalidation is not yet a primary concern, but the map itself represents long-lived allocations.
-* **Result Set Allocations (`Values []Row`):** For `SELECT` operations, the engine must allocate slices to hold the result matrix. Currently, operations like `subsetRow` create intermediate allocations in memory to filter the physical row down to the requested projection. In a high-throughput environment, this intermediate slice allocation per row can trigger heavy Garbage Collection (GC) pressure. Future optimizations may require zero-copy slicing or arena allocators to manage this memory churn.
+* **The Cache Map:** Keeping schemas in memory (`tables map[string]Schema`) trades a little bit of RAM for a massive speed boost in CPU and I/O efficiency. Since table structures don't change often, this is a highly efficient long-term memory allocation.
+* **Result Set Allocations:** When a `SELECT` query runs, slicing out specific columns creates temporary memory allocations. In a high-traffic database, creating and destroying these slices constantly will force Go's Garbage Collector to work overtime.
 
 ## System Constraints
+* **Primary Key Immutability:** You cannot change a primary key using an `UPDATE` statement. In our KV store, the primary key is the literal physical address of the data. Changing it requires a costly logical `DELETE` followed by a new `INSERT`, so we strictly limit updates to the row's values only.
+* **Exact-Match Limitation:** Because of how our physical lookups work right now, `SELECT` queries are temporarily limited to exact primary key matches (e.g., `WHERE id = 5`). Range scans (e.g., `WHERE id > 5`) are not supported until we build iterator mechanics later down the line.
 
-By pushing constraints down to the lowest possible layers, we establish strict boundaries for the current iteration of the engine:
 
-* **Primary Key Immutability:** The `UPDATE` execution pipeline explicitly forbids the modification of primary keys. Physically, a relational update to a primary key is not a true update in a KV store; it requires a logical `DELETE` of the old key-value pair and an `INSERT` of the new one. By constraining `UPDATE` to only modify the value payload, we avoid the heavy I/O and potential fragmentation overhead of key deletion and recreation.
-* **Exact-Match Indexing Limitation:** The `makePKey` helper function currently implies exact-match indexing. Because the execution layer relies on fully constructed keys to query the underlying storage, the engine is temporarily constrained to point queries (e.g., `WHERE id = 5`). Range scans (e.g., `WHERE id > 5`) or full table scans are not supported until a cursor or iterator mechanism is implemented at the KV layer.
+## Syntax, functions..
+* json.Unmarshal: In Go, this is the primary function in the encoding/json package used to decode JSON data into Go data structures. It takes a JSON byte slice and a pointer to the target variable, automatically allocating maps, slices, and pointers as necessary. 
+
+* json.Marshal: In Go, this is the process of converting GO data structures into JSON format using this function from the standard encoding/json package. 
