@@ -52,19 +52,43 @@ func (kv *KV) Get(key []byte) (val []byte, ok bool, err error) {
 	return val, ok, nil
 }
 
-// Set stores a value. Reports true if the database state actually changed.
-//     method           input (arguments)     return type
-func (kv *KV) Set(key []byte, val []byte) (updated bool, err error) {
+type UpdateMode int
+
+const (
+	ModeUpsert UpdateMode = 0 // insert or update.
+	ModeInsert UpdateMode = 1 // Insert new .
+	ModeUpdate UpdateMode = 2 // update existing.
+)
+
+func (kv *KV) SetEx(key []byte, val []byte, mode UpdateMode) (updated bool, err error) {
+	// 1. Look up the current state.
 	prev, exist := kv.mem[string(key)]
-	updated = !exist || !bytes.Equal(prev, val)
+
+	// 2. Eval. the write intent.
+	switch mode {
+	case ModeUpsert:
+		updated = !exist || !bytes.Equal(prev, val)
+	case ModeInsert:
+		updated = !exist
+	case ModeUpdate:
+		updated = exist && !bytes.Equal(prev, val)
+	default:
+		panic("unreachable")
+	}
+
+	// 3. Apply the mutation if the eval. passed.
 	if updated {
-		// Log to disk FIRST
 		if err = kv.log.Write(&Entry{key: key, val: val}); err != nil {
 			return false, err
 		}
 		kv.mem[string(key)] = val
 	}
 	return
+}
+
+// Set stores a value. Reports true if the database state actually changed.
+func (kv *KV) Set(key []byte, val []byte) (updated bool, err error) {
+	return kv.SetEx(key, val, ModeUpsert)
 }
 
 // Del removes a key. Reports true if a key was actually removed.
@@ -79,4 +103,3 @@ func (kv *KV) Del(key []byte) (deleted bool, err error) {
 	}
 	return
 }
-// QzBQWVJJOUhU https://trialofcode.org/
