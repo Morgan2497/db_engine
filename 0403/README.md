@@ -9,7 +9,69 @@ When we execute a range query (e.g., `SELECT * WHERE age > 20`), the physical KV
 
 **The Problem:** If we take relational data (like a signed `int64` or a dynamically sized string) and serialize it into bytes using standard methods, the resulting raw bytes will often sort in the **wrong logical order**. For instance, negative integers might evaluate as "larger" than positive ones in raw binary, or a shorter string might sort after a longer one due to how length prefixes are evaluated.
 
-# Example:
+## 1. The Variable-Length String Problem (The Prefix Bug)
+When building a database index, lexicographical order (dictionary order) must be maintained. If strings are serialized using a standard `[length_prefix][data]` format, the sorting engine will evaluate the length byte first, which completely breaks alphabetical sorting.
+
+### Example: "Z" vs "AA"
+* **Logical Alphabetical Order:** "AA" comes before "Z" (`"AA" < "Z"`).
+* **The Raw Memory (Length-Prefixed):**
+  * "Z" (Length 1, ASCII 90): `[0x01, 0x5A]`
+  * "AA" (Length 2, ASCII 65, 65): `[0x02, 0x41, 0x41]`
+* **The `bytes.Compare()` Execution:**
+  * The KV store compares the very first byte (the length prefix).
+  * `0x01` is less than `0x02`.
+  * **Outcome:** The database incorrectly sorts "Z" as smaller than "AA".
+
+**The Solution:** This is why databases abandon length prefixes for indexed keys and use C-style **null-terminated strings** combined with escape characters (e.g., escaping literal `0x00` bytes as `0x01 0x01`). This forces the byte comparison to evaluate the actual character data first.
+
+---
+
+## 2. The 64-Bit Signed Integer Problem (Full Bit Representation)
+Standard binary uses Two's Complement for negative numbers, setting the Most Significant Bit (MSB) to `1`. Because the KV engine reads bytes blindly from left to right as unsigned magnitudes, negative numbers will structurally appear larger than positive numbers.
+
+### Step-by-Step Example
+Let's trace three 64-bit integers (`int64`) in their correct logical order: **-2 < 0 < 2**
+
+**Step 1: The Raw Memory (The Bug)**
+If we write these numbers directly to disk in Big-Endian format, here is the exact 64-bit machine representation:
+* **-2:** `11111111 11111111 11111111 11111111 11111111 11111111 11111111 11111110` (Hex: `0xFFFFFFFFFFFFFFFE`)
+* **0:**  `00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000` (Hex: `0x0000000000000000`)
+* **2:**  `00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000010` (Hex: `0x0000000000000002`)
+
+*Result:* `bytes.Compare()` looks at the first byte. `0xFF` (255) is vastly larger than `0x00` (0). The engine incorrectly sorts them as: **0 < 2 < -2**.
+
+**Step 2: Applying the MSB Flip (The Fix)**
+We map the signed space to the unsigned space by flipping only the first bit. We achieve this using a bitwise XOR against `1 << 63` (Hex `0x8000000000000000`).
+
+* **-2:** `01111111 11111111 11111111 11111111 11111111 11111111 11111111 11111110` (Hex: `0x7FFFFFFFFFFFFFFE`)
+* **0:**  `10000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000` (Hex: `0x8000000000000000`)
+* **2:**  `10000000 00000000 00000000 00000000 00000000 00000000 00000000 00000010` (Hex: `0x8000000000000002`)
+
+*Result:* The engine reads the first byte. `0x7F` (127) < `0x80` (128). The new byte order evaluates as `0x7F... < 0x80...00 < 0x80...02`. The physical byte order now perfectly matches the logical order (**-2 < 0 < 2**).
+
+---
+
+## 3. Implementation in Go
+To implement this cleanly in Go, we rely on the `encoding/binary` package combined with native bitwise operators. 
+
+```go
+package kv
+
+import (
+	"encoding/binary"
+)
+
+// EncodeI64 transforms a signed int64 into an order-preserving byte slice.
+func EncodeI64(out []byte, val int64) []byte {
+	// 1. Cast the int64 to uint64 so Go doesn't apply signed arithmetic shifts.
+	// 2. XOR it with (1 << 63) to flip the Most Significant Bit.
+	unsigned := uint64(val) ^ (1 << 63)
+	
+	// 3. Append it as Big-Endian so the MSB is evaluated first by bytes.Compare()
+	return binary.BigEndian.AppendUint64(out, unsigned)
+}```
+
+## Example:
 - When KV keys are compared as raw strings or bytes, serialized data types may compare in the wrong order because their byte representations do not preserve logical value ordering (e.g., lexicographic string comparison of "10" vs "2" yields "10" < "2", whereas numeric comparison yields 2 < 10). 
 
 - To resolve this, systems must either:
