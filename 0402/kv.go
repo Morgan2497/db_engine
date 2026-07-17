@@ -18,6 +18,12 @@ type KV struct {
 	vals [][]byte
 }
 
+type KVIterator struct {
+	keys [][]byte
+	vals [][]byte
+	pos int
+}
+
 // The disk log is "append-only", it contains a messy history of every action ever taken.
 // If a user created a post, updated it twice, and then deleted it, te log contains four
 // separate entries for that one key. Open() cleans this up. It reads all entries into memeory,
@@ -163,12 +169,45 @@ func (kv *KV) Del(key []byte) (deleted bool, err error) {
 	if !exist {
 		return false, nil
 	}
-	if deleted {
-		// Write tombstone to disk FIRST
-		if err = kv.log.Write(&Entry{key: key, deleted: true}); err != nil {
-			return false, err
-		}
-		delete(kv.mem, string(key))
+
+	// 3. Durability First: Write the tombstone to the physical disk log.
+	if err = kv.log.Write(&Entry{key: key, deleted: true}); err != nil {
+		return false, err
 	}
-	return
+
+	// 4. In-Memory Deletion: Shift arrays to overwrite the deleted index.
+	kv.keys = slices.Delete(kv.keys, idx, idx+1)
+	kv.vals = slices.Delete(kv.vals, idx, idx+1)
+	return true, nil
 }
+
+func (kv *KV) Seek(key []byte) (*KVIterator, error) {
+	// 1. Call binary search to find the first index where kv.keys[i] >= key.
+	pos, _ := slices.BinarySearchFunc(kv.keys, key, bytes.Compare)
+	return &KVIterator{keys: kv.keys, vals: kv.vals, pos: pos}, nil
+}
+
+func (iter *KVIterator) Valid() bool {
+	return 0 <= iter.pos && iter.pos < len(iter.keys)
+}
+
+func (iter *KVIterator) Key() []byte {return iter.keys[iter.pos]}
+
+func (iter *KVIterator) Val() []byte {return iter.vals[iter.pos]}
+
+// Positions -1 and len(keys) means out of range. With this design,
+// moving one step back when out of range can return to range.
+func (iter *KVIterator) Prev() error {
+	if iter.pos >= 0 {
+		iter.pos--
+	}
+	return nil
+}
+
+func (iter *KVIterator) Next() error {
+	if iter.pos < len(iter.keys) {
+		iter.pos++
+	}
+	return nil
+}
+
