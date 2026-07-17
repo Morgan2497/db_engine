@@ -75,6 +75,71 @@ An LSM-Tree takes a completely different approach optimized for extreme write th
 
 All new writes go to a small, fast in-memory array (`activeArray`). When this array reaches a size limit, the engine freezes it, marks it as immutable, and writes the entire sorted array to disk as a new file in `level0`. Because it never inserts into the middle of an existing disk file, there is **zero array shifting**. All writes are pure appends.
 
+## 1. B+Tree: "Nested Arrays"
+
+**Concept:** Breaks data into tiny, bounded arrays (pages). Insertion shifts elements only within the specific small page.
+
+**Scenario:** Inserting `10, 20, 30, 40, 5` with a **max node size of 3**.
+
+### Step 1: Initial Inserts
+Keys fit into the root.
+```text
+Root: [10, 20, 30]
+```
+
+### Step 2: Insert 40 (Split)
+Overflow triggers a split. The middle key moves up.
+```text
+      [20]
+     /    \
+[10, 20]  [30, 40]
+```
+
+### Step 3: Insert 5 (Localized Shift)
+Search goes left. Only the tiny leaf array is modified.
+```text
+      [20]
+     /    \
+[5, 10, 20]  [30, 40]
+```
+**Result:** Shifting is **O(1)** relative to the total dataset because it happens only inside a 4KB page.
+
+---
+
+## 2. LSM-Tree: "Multi-Layered Arrays"
+
+**Concept:** Writes go to an in-memory array (MemTable). When full, the whole array is flushed to disk as an **immutable** file. No shifting ever occurs on disk.
+
+**Scenario:** Inserting `10, 20, 5, 30, 15` with a **MemTable limit of 3**.
+
+### Step 1: Memory Writes
+Data accumulates in memory.
+```text
+MemTable: [5, 10, 20]
+```
+
+### Step 2: Flush to Disk
+Limit reached. The array freezes and writes to **Level 0** as a new file.
+```text
+Disk (Level 0): [ [5, 10, 20, 30] ]  <-- Immutable File
+MemTable:       []                   <-- Empty, ready for new writes
+```
+
+### Step 3: Overlapping Files
+New writes create a second file. Files are **not** merged immediately.
+```text
+Disk (Level 0):
+  File A: [5, 10, 20, 30]
+  File B: [15, 25, 35]     <-- Overlaps with File A
+```
+
+### Step 4: Compaction
+A background process merges files later.
+```text
+Disk (Level 1): [ [5, 10, 15, 20, 25, 30, 35] ] <-- Merged & Sorted
+```
+**Result:** Write path is **pure append**. Expensive merging is deferred to the background.
+
 ---
 
 ## 4. In-Memory Memory Layout & Schema
