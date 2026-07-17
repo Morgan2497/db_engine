@@ -49,27 +49,6 @@ We map the signed space to the unsigned space by flipping only the first bit. We
 
 *Result:* The engine reads the first byte. `0x7F` (127) < `0x80` (128). The new byte order evaluates as `0x7F... < 0x80...00 < 0x80...02`. The physical byte order now perfectly matches the logical order (**-2 < 0 < 2**).
 
----
-
-## 3. Implementation in Go
-To implement this cleanly in Go, we rely on the `encoding/binary` package combined with native bitwise operators. 
-
-```go
-package kv
-
-import (
-	"encoding/binary"
-)
-
-// EncodeI64 transforms a signed int64 into an order-preserving byte slice.
-func EncodeI64(out []byte, val int64) []byte {
-	// 1. Cast the int64 to uint64 so Go doesn't apply signed arithmetic shifts.
-	// 2. XOR it with (1 << 63) to flip the Most Significant Bit.
-	unsigned := uint64(val) ^ (1 << 63)
-	
-	// 3. Append it as Big-Endian so the MSB is evaluated first by bytes.Compare()
-	return binary.BigEndian.AppendUint64(out, unsigned)
-}```
 
 ## Example:
 - When KV keys are compared as raw strings or bytes, serialized data types may compare in the wrong order because their byte representations do not preserve logical value ordering (e.g., lexicographic string comparison of "10" vs "2" yields "10" < "2", whereas numeric comparison yields 2 < 10). 
