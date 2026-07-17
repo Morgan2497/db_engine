@@ -9,6 +9,16 @@ When we execute a range query (e.g., `SELECT * WHERE age > 20`), the physical KV
 
 **The Problem:** If we take relational data (like a signed `int64` or a dynamically sized string) and serialize it into bytes using standard methods, the resulting raw bytes will often sort in the **wrong logical order**. For instance, negative integers might evaluate as "larger" than positive ones in raw binary, or a shorter string might sort after a longer one due to how length prefixes are evaluated.
 
+# Example:
+- When KV keys are compared as raw strings or bytes, serialized data types may compare in the wrong order because their byte representations do not preserve logical value ordering (e.g., lexicographic string comparison of "10" vs "2" yields "10" < "2", whereas numeric comparison yields 2 < 10). 
+
+- To resolve this, systems must either:
+
+1. Use native type comparison: Ensure keys are stored and compared as their original types (e.g., integers compared numerically) rather than serialized strings. 
+2. Apply lexicographic encoding: Convert values into byte sequences that preserve ordering, such as using fixed-width padding for integers (e.g., 00000002 vs 00000010) or IEEE-754 bit-preserving floats for numeric sorting. 
+3. Without these adjustments, relying on default byte comparison (bytes.Compare()) leads to incorrect query results when retrieving ranges or sorting keys in embedded KV stores like RocksDB or SQLite.
+
+
 ## The Concept & Theory: Order-Preserving Serialization
 Faced with this sorting mismatch, database engineers have two choices:
 
