@@ -107,6 +107,9 @@ cell := &Cell{
 toAppend := []byte{0x75, 0x73, 0x65, 0x72, 0x73, 0x00}
 */
 func (cell *Cell) EncodeKey(toAppend []byte) []byte {
+	// we threw away the binary.LittleEndian.AppendUint32 logic entirely here.
+	// Instead of telling the database how long the string is, we shifted to
+	// C style Null-Terminated architecture.
 	switch cell.Type {
 	case TypeI64:
 		// Map signed int64 to unsigned space by flippint the Most Significant Bit 
@@ -114,8 +117,7 @@ func (cell *Cell) EncodeKey(toAppend []byte) []byte {
 		return binary.BigEndian.AppendUint64(toAppend, unsigned)
 
 	case TypeStr:
-		toAppend = binary.LittleEndian.AppendUint32(toAppend, uint32(len(cell.Str)))
-		return append(toAppend, cell.Str...)
+		return encodeStrKey(toAppend, cell.Str)
 	}
 
 	default:
