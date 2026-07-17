@@ -108,7 +108,6 @@ func TestSQLByPKey(t *testing.T) {
 	s = "select time from link where dst = 'alice' and src = 'bob';"
 	r, err = db.ExecStmt(parseStmt(t, s))
 	require.Nil(t, err)
-	logSQLResult(t, r)
 	require.Equal(t, []Row{{Cell{Type: TypeI64, I64: 123}}}, r.Values)
 
 	s = "update link set time = 456 where dst = 'alice' and src = 'bob';"
