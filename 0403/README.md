@@ -135,7 +135,7 @@ Now, let's let the KV engine run `bytes.Compare()` on our newly formatted binary
 *Result: The physical byte order now perfectly mirrors the logical math order (-2 < 0 < 2). Our serialization format is now officially Order-Preserving, and the KV engine can safely and blindly sort primary keys without knowing what an integer is.*
 To achieve this, the engine's serialization logic must split into two distinct paths:
 * `EncodeVal()`: Used for data payloads. It prioritizes space and speed. It does not care about sorting.
-* `EncodeKey()`: Used exclusively for Primary Keys. It translates complex data types into a strict, order-preserving byte sequence so the underlying index (like a B-Tree) can traverse it cleanly.
+* `EncodeKey()`: Used exclusively for Primary Keys. It translates complex data types into a strict, order-preserving byte sequence so the underlying index (like an LSM-Tree) can traverse it cleanly.
 
 ---
 
@@ -219,8 +219,8 @@ To create the final physical key, the engine simply concatenates (glues) them:
     *   **Search Target**: `11100100 10000101`
 
 *   **Engine Action:**
-    The database feeds this exact binary string into the B-Tree index. Because this bit pattern is unique and perfectly sorted, the B-Tree algorithm seeks directly down to the exact physical leaf node on the disk.
-    *   **Cost**: $O(\log N)$. It finds the exact row in roughly 3 to 4 quick disk jumps.
+    The LSM-Tree engine compares this full binary string against its internal structures. Since the binary representation is unique and ordered, it leverages Bloom filters and sparse indexes to jump directly to the exact block within its Sorted String Tables (SSTables) containing this bit pattern.
+    *   **Cost**: Highly optimized $O(\log N)$ or $O(1)$ with Bloom filters, rapidly isolating the exact row across storage levels.
 
 
 2. Prefix Scans (The "Superpower"): WHERE OrderID = 100 (Get all products in an order)
@@ -248,7 +248,7 @@ To get these rows, the engine refuses to scan the whole table. Instead, it calcu
     *   Take the target prefix `[Enc(100)]`: `11100100`
     *   Append the *absolute lowest* possible suffix (all zeros): `00000000`
     *   **Start Target**: `11100100 00000000`
-    *   *Result:* The B-Tree seeks to this exact point on disk, landing right at the beginning of Order 100.
+    *   *Result:* The LSM-Tree seeks to this exact point in its index, locating the block right at the beginning of Order 100.
 
 2.  **Calculate the Stop Key (Exclusive):**
     *   Take the target prefix `[Enc(100)]` and **add 1** to it: `11100101` (Which is Order 101).
@@ -287,7 +287,7 @@ To execute this without reading the entire disk, the engine calculates the extre
     *   Take the bottom boundary prefix `[Enc(100)]`. Let's abstract the binary to `...01100100`.
     *   Append the *absolute lowest* possible suffix (all zeros): `00000000`.
     *   **Start Target**: `...01100100 00000000`
-    *   *Result:* The B-Tree seeks to this exact point, landing exactly at the beginning of Order 100.
+    *   *Result:* The LSM-Tree seeks to this exact point, landing exactly at the beginning of Order 100.
 
 2.  **Calculate the Stop Key (Exclusive):**
     *   Because we want to *include* all of Order 200, we must tell the engine to stop at the exact beginning of Order 201.
@@ -296,7 +296,7 @@ To execute this without reading the entire disk, the engine calculates the extre
     *   **Stop Target**: `...11001001 00000000`
 
 ### Engine Action (The Physical Sweep)
-The B-Tree seeks to the **Start Target** (`Order 100, Product 0`) and turns on the data stream. 
+The LSM-Tree seeks to the **Start Target** (`Order 100, Product 0`) using its memtable and SSTable iterators, and turns on the data stream. 
 
 The mechanical read-head sweeps forward sequentially across the disk. It reads Order 100, then naturally flows right into Order 101, Order 102, all the way through Order 200. It blindly streams every single byte it touches into memory, doing nothing but a fast lexicographical comparison against the Stop Target.
 
@@ -308,15 +308,15 @@ The mechanical read-head sweeps forward sequentially across the disk. It reads O
 ---
 
 ## Why This Architecture is Powerful for Range Queries
-If the database did not use order-preserving binary concatenation, executing `BETWEEN 100 AND 200` would require the engine to perform 101 individual, scattered $O(\log N)$ B-Tree lookups (one seek for Order 100, one seek for 101, one seek for 102, etc.). 
+If the database did not use order-preserving binary concatenation, executing `BETWEEN 100 AND 200` would require the engine to perform 101 individual, scattered lookups across the LSM components. 
 
-Instead, by aligning the physical byte layout with the logical sorting order, the database engine transforms a massive multi-order query into a **single $O(\log N)$ seek, followed by one continuous, high-speed sequential read.** This specific mechanical advantage is exactly how production database engines achieve massive throughput on reporting and financial analytics queries.
+Instead, by aligning the physical byte layout with the logical sorting order, the database engine transforms a massive multi-order query into a **highly optimized seek, followed by one continuous, high-speed sequential read.** This specific mechanical advantage is exactly how production database engines achieve massive throughput on reporting and financial analytics queries.
 
-* **Preparation for Advanced Indexing:** This chapter is the critical bridge between basic storage and advanced database mechanics. The `Seek(target)` iterator we built previously is entirely reliant on the fact that keys are sorted accurately in memory or on disk. By ensuring our serialization format naturally preserves logical order, we have paved the exact runway needed to transition our data layer into B-Trees or LSM-Trees.
+* **Preparation for Advanced Indexing:** This chapter is the critical bridge between basic storage and advanced database mechanics. The `Seek(target)` iterator we built previously is entirely reliant on the fact that keys are sorted accurately in memory or on disk. By ensuring our serialization format naturally preserves logical order, we have paved the exact runway needed to transition our data layer into LSM-Trees.
 
 # Deep Dive: Why Order-Preserving Serialization is the Runway for Advanced Indexing
 
-Even though we haven't written the code for B-Trees or LSM-Trees yet, this chapter is the exact architectural prerequisite for them. Here is the reasoning behind why we must solve this sorting problem *now*, before we can build those advanced structures.
+Even though we haven't written the code for LSM-Trees yet, this chapter is the exact architectural prerequisite for them. Here is the reasoning behind why we must solve this sorting problem *now*, before we can build those advanced structures.
 
 ## 1. The Mechanics of `Seek(target)` and Binary Search
 In Chapter 0402, we transitioned from basic hash maps to ordered arrays, and we built a `Seek(target)` iterator. To make `Seek` fast ($O(\log N)$), we rely on **Binary Search**.
@@ -327,19 +327,18 @@ Think about how Binary Search physically operates: it jumps to the middle of the
 
 **The Catastrophe:** If we do not use order-preserving serialization, the physical bytes will lie to the Binary Search algorithm. If you search for `Logical 10`, but standard serialization causes `Logical 10` to look like a smaller byte-sequence than `Logical 2`, the Binary Search will go *left* instead of *right*. It will look in the wrong half of the array, and your data will simply "vanish" from the database's perspective. 
 
-## 2. The B-Tree Connection (Routing by Bytes)
-A B-Tree (which powers Postgres, MySQL, and most modern databases) is essentially a massive, disk-based version of our ordered array. 
+## 2. The LSM-Tree Connection (Routing and Compaction by Bytes)
+An LSM-Tree (which powers modern engines like RocksDB, Cassandra, and LevelDB) is essentially built on massive, disk-based versions of our ordered array called SSTables (Sorted String Tables). 
 
-A B-Tree consists of a Root node, Branch nodes, and Leaf nodes. Inside every Branch node are "pivot keys" that tell the engine which path to take down the tree. 
-* *Example:* "If target `< 0x80`, go down the left disk block. If target `>= 0x80`, go down the right disk block."
+An LSM-Tree relies on an in-memory MemTable and multiple levels of immutable on-disk SSTables. To route queries without scanning everything, the engine uses sparse indexes and Bloom filters that hold "pivot keys" representing the start and end ranges of data blocks. 
 
-To achieve extreme performance, the B-Tree engine must be incredibly "dumb." It does not have time to deserialize bytes into Go `int64` structs or parse SQL strings at every single node intersection. It relies strictly on extremely fast `bytes.Compare()` operations. 
+To achieve extreme performance, the LSM-Tree engine must be incredibly "dumb." It does not have time to deserialize bytes into Go `int64` structs or parse SQL strings during rapid memtable flushes or background compactions. It relies strictly on extremely fast `bytes.Compare()` operations. 
 
-If the byte representation does not perfectly match the logical truth, the B-Tree routing algorithm will send the read-head down the completely wrong branch of the tree.
+If the byte representation does not perfectly match the logical truth, the LSM-Tree routing algorithm will check the completely wrong SSTable blocks, and background compactions will merge data into the wrong sequential order.
 
 ## 3. The "Runway" Metaphor
-You cannot build a high-speed jet (a B-Tree) if your runway is covered in potholes. 
+You cannot build a high-speed jet (an LSM-Tree) if your runway is covered in potholes. 
 
-Before we can start building complex tree structures that partition data across a hard drive, we must have absolute, 100% mathematical certainty that if `A < B` logically, then `[]byte(A) < []byte(B)` physically. 
+Before we can start building complex tree structures that partition and merge data across a hard drive, we must have absolute, 100% mathematical certainty that if `A < B` logically, then `[]byte(A) < []byte(B)` physically. 
 
-By taking the time in Chapter 0403 to build our `EncodeKey()` methods with MSB-flips and null-terminated strings, we have completely paved the runway. We have guaranteed that our physical storage medium natively obeys logical math. Because of this, when we do start building B-Trees in the upcoming chapters, the tree logic can simply trust the bytes and route queries flawlessly.
+By taking the time in Chapter 0403 to build our `EncodeKey()` methods with MSB-flips and null-terminated strings, we have completely paved the runway. We have guaranteed that our physical storage medium natively obeys logical math. Because of this, when we do start building LSM-Trees in the upcoming chapters, the merging and compaction logic can simply trust the bytes and route queries flawlessly.
