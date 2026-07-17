@@ -51,9 +51,20 @@ We map the signed space to the unsigned space by flipping only the first bit. We
 
 
 ## Example:
-- When KV keys are compared as raw strings or bytes, serialized data types may compare in the wrong order because their byte representations do not preserve logical value ordering (e.g., lexicographic string comparison of "10" vs "2" yields "10" < "2", whereas numeric comparison yields 2 < 10). 
+* When KV keys are compared as raw strings or bytes, serialized data types may compare in the wrong order because their byte representations do not preserve logical value ordering (e.g., lexicographic string comparison of "10" vs "2" yields "10" < "2", whereas numeric comparison yields 2 < 10). 
 
-- To resolve this, systems must either:
+*  Serialized String the raw sequence of bytes produced when a data value (like a number, date, or object) is converted into a linear format for storage or transmission.
+
+In the context of Key-Value (KV) stores and the sorting issues you mentioned:
+- Definition: It is the byte representation of a value after an encoding scheme (like JSON, MessagePack, Protocol Buffers, or simple binary casting) is applied.
+
+- The Sorting Trap: When these bytes are compared using standard functions like bytes.Compare(), they are evaluated lexicographically (byte-by-byte from left to right), not by their logical value.
+
+- Example: The integer 10 serialized as a standard string is the bytes ['1', '0']. The integer 2 is ['2'].
+
+- Since the byte 0x31 ('1') is less than 0x32 ('2'), the serialized string for 10 sorts before 2, which is logically incorrect for numeric data.
+
+*  To resolve this, systems must either:
 
 1. Use native type comparison: Ensure keys are stored and compared as their original types (e.g., integers compared numerically) rather than serialized strings. 
 2. Apply lexicographic encoding: Convert values into byte sequences that preserve ordering, such as using fixed-width padding for integers (e.g., 00000002 vs 00000010) or IEEE-754 bit-preserving floats for numeric sorting. 
