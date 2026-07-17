@@ -181,3 +181,28 @@ When `kv.Open()` executes, the engine must perform a complete linear recovery:
 1. Open the append-only write-ahead log (`Log`) from persistent storage.
 2. Read every individual log entry sequentially from the beginning of the stream to the end.
 3. Reconstruct the sorted arrays in-memory by parsing the keys, evaluating their correct ordered offsets, and populating the `keys` and `vals` slices fully before accepting incoming client traffic.
+
+
+## 7. High-Level Architecture
+The read path leverages logarithmic time binary search across the strictly ordered keys array. If the search yields a valid index, the engine retrieves the corresponding payload from the vals array via direct spatial alignment.
+
+```
+kv := &KV{
+	log: Log{},
+	keys: [][]byte{
+		[]byte("post:10"),
+		[]byte("post:20"),
+		[]byte("post:30"),
+	},
+	vals: [][]byte{
+		[]byte(`{"author":"alice"}`),
+		[]byte(`{"author":"bob"}`),
+		[]byte(`{"author":"charlie"}`),
+	},
+}
+key := []byte("post:25")
+```
+
+
+```
+```
