@@ -21,7 +21,7 @@ type Cell struct {
 
 var ErrUnknownCellType = errors.New("unknown cell type")
 
-func (cell *Cell) Encode(toAppend []byte) []byte {
+func (cell *Cell) EncodeVal(toAppend []byte) []byte {
 	switch cell.Type {
 	case TypeI64:
 		var buf [8]byte
@@ -35,7 +35,7 @@ func (cell *Cell) Encode(toAppend []byte) []byte {
 	}
 }
 
-func (cell *Cell) Decode(data []byte) (rest []byte, err error) {
+func (cell *Cell) DecodeVal(data []byte) (rest []byte, err error) {
 	switch cell.Type {
 	case TypeI64:
 		if len(data) < 8 {

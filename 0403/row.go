@@ -46,7 +46,7 @@ func (row Row) EncodeKey(schema *Schema) (key []byte) {
 		if slices.Contains(schema.PKey, idx) {
 			// Ensure tje cell type matches the shcema definition.
 			check(value.Type == schema.Cols[idx].Type)
-			key = row[idx].Encode(key)
+			key = row[idx].EncodeVal(key)
 		}
 
 	}
@@ -63,7 +63,7 @@ func (row Row) EncodeVal(schema *Schema) (val []byte) {
 		// 3. If not pk, then proceed.
 		if !slices.Contains(schema.PKey, idx) {
 			check(value.Type == schema.Cols[idx].Type)
-			val = row[idx].Encode(val)
+			val = row[idx].EncodeVal(val)
 		}
 	}
 	return val
@@ -89,7 +89,7 @@ func (row Row) DecodeKey(schema *Schema, key []byte) (err error) {
 		row[idx].Type = schema.Cols[idx].Type
 
 		if slices.Contains(schema.PKey, idx) {
-			key, err = row[idx].Decode(key)
+			key, err = row[idx].DecodeVal(key)
 
 			if err != nil {
 				return err
@@ -108,7 +108,7 @@ func (row Row) DecodeVal(schema *Schema, val []byte) (err error) {
 		if !slices.Contains(schema.PKey, idx) {
 			row[idx].Type = schema.Cols[idx].Type
 
-			val, err = row[idx].Decode(val)
+			val, err = row[idx].DecodeVal(val)
 			if err != nil {
 				return err
 			}
