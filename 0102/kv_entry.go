@@ -13,7 +13,10 @@
 // | key size | val size | key data | val data |
 // | 4 bytes  | 4 bytes  |   ...    |   ...    |
 // For example, key=a and val=bb returns []byte(1, 0, 0, 0, 2, 0, 0, 0, 'a', 'b', 'b').
-
+// Example trace (key="k1", val="xxx"):
+// Offset:  0    	4    	8       10
+// 			[2,0,0,0][3,0,0,0]['k','1']['x','x','x']
+//
 package kv 
 import (
 	"encoding/binary"
