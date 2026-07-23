@@ -201,6 +201,115 @@ Row     →  WHAT each index holds  (Cell: actual value)
 
 ---
 
+### 1c. Structured vs flat — what gets flattened (crucial)
+
+Three different things — do not merge them in your head:
+
+```text
+1. Schema     → stays structured (Cols, PKey, Table name) — NOT flattened
+2. Row        → already one array: []Cell — structured cells, not flat bytes yet
+3. key / val  → flattened []byte for KV — THIS is where flattening happens
+```
+
+#### Schema — NOT flattened
+
+```go
+schema := &Schema{
+    Table: "link",
+    Cols:  []Column{...},  // separate column definitions
+    PKey:  []int{1, 2},   // separate PK list
+}
+```
+
+The schema stays a **blueprint**. It **guides** encoding. It is never turned into one byte array inside `EncodeKey` / `EncodeVal`.
+
+#### Row — array of structured cells
+
+```go
+row := Row{
+    Cell{I64: 123},      // index 0
+    Cell{Str: "a"},      // index 1
+    Cell{Str: "b"},      // index 2
+}
+```
+
+`Row` is `[]Cell` — one slice in memory, but each slot is still a **structured** `Cell` (Type + I64/Str). **Not flat bytes yet.**
+
+#### EncodeKey / EncodeVal — flattening happens here
+
+Encoding turns **selected cells** into **one continuous `[]byte`** each:
+
+```text
+STRUCTURED (Go objects)                 FLAT ([]byte for KV)
+─────────────────────                 ────────────────────
+
+Schema (guide only)                   (not stored in key/val)
+  Table: "link"
+  Cols: [time, src, dst]
+  PKey: [1, 2]
+        │
+        │ guides which cells go where
+        ▼
+Row []Cell
+┌─────────┬─────────┬─────────┐
+│ Cell    │ Cell    │ Cell    │
+│ time    │ src     │ dst     │
+│ 123     │ "a"     │ "b"     │
+└────┬────┴────┬────┴────┬────┘
+     │         │         │
+     │ skip    │         │
+     │ (not PK)│         │
+     │         ▼         ▼
+     │    EncodeKey ──────────►  key[]  one array (e.g. 15 bytes)
+     │         table\0 + encoded PK cells
+     │
+     ▼
+EncodeVal ─────────────────────►  val[]  one array (e.g. 8 bytes)
+              encoded non-PK cells only
+```
+
+| Flat array | What got glued in | What was left out |
+| :--- | :--- | :--- |
+| **`key`** | `table` bytes + `0x00` + encoded **PK** cells | non-PK columns, schema metadata |
+| **`val`** | encoded **non-PK** cells only | PK cells, table name, schema |
+
+#### EncodeKey: two different operations on `key`
+
+`key` is a **variable** — the `[]byte` slice we are **building**. We are not "encoding the table name with `Cell.Encode`."
+
+| Step | Code | What gets added to `key` |
+| :--- | :--- | :--- |
+| `append([]byte(schema.Table), 0x00)` | line 46 | Table name as raw ASCII bytes + byte `0` |
+| `row[idx].Encode(key)` | loop, PK indices only | Encoded **PK cell** bytes appended onto existing `key` |
+
+```text
+key grows in stages:
+
+  AFTER line 46:     [link\0]                          (5 bytes)
+  AFTER row[1]:      [link\0][enc src]                 (10 bytes)
+  AFTER row[2]:      [link\0][enc src][enc dst]        (15 bytes)
+```
+
+`row[idx].Encode(key)` means: **append this cell's bytes onto whatever is already in `key`** (0201 `toAppend` pattern).
+
+#### Analogy
+
+```text
+Schema  = recipe card (not blended, not flattened)
+Row     = ingredients in separate bowls ([]Cell)
+Encode  = pour selected ingredients into one cup → key or val ([]byte)
+```
+
+**Cheat line:**
+
+```text
+Schema stays structured and only directs the split.
+Row is []Cell (structured values).
+EncodeKey / EncodeVal flatten selected cells (+ table prefix for key) into one []byte each for KV.
+```
+
+---
+
 ### 2. Master diagram (one glance)
 
 ```text
