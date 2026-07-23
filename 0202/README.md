@@ -22,6 +22,222 @@ Logical row                         Physical KV
 
 ---
 
+## Quick Reference — Big Picture (read this when you forget)
+
+This section ties **0201 `Cell`** to **0202 `Schema` + `Row`**. The KV layer (0103–0105) only sees the final `[]byte` key and value at the bottom.
+
+### 1. What contains what?
+
+```text
+Schema  = blueprint of ONE table (column names, types, PK indices)
+            │
+            │  defines the shape of
+            ▼
+Row     = ONE table row = []Cell  (one Cell per column, same order as Cols)
+            │
+            │  each slot is
+            ▼
+Cell    = ONE typed value (i64 or str) from 0201 — knows Encode/Decode bytes
+```
+
+| Question | Answer |
+| :--- | :--- |
+| Is `Cell` inside `Schema`? | **No.** Schema describes columns; it does not hold data. |
+| Is `Cell` inside `Row`? | **Yes.** `Row` is literally `[]Cell`. |
+| Who says column 1 is a string? | **Schema** (`Cols[1].Type`). |
+| Who holds `src = "a"`? | **Row** (`row[1]` is a `Cell`). |
+| Who turns `"a"` into bytes? | **Cell.Encode** (0201). |
+| Who decides key vs value split? | **Row.EncodeKey / EncodeVal** using **Schema.PKey**. |
+
+**Analogy:** Schema = form template · Row = one filled form · Cell = one field on the form.
+
+---
+
+### 2. Master diagram (one glance)
+
+```text
+┌─────────────────────────────────────────────────────────────────────────┐
+│  SCHEMA (metadata — no row data)                                        │
+│  Table="link"  Cols=[time:i64, src:str, dst:str]  PKey=[1, 2]          │
+└───────────────────────────────┬─────────────────────────────────────────┘
+                                │ shapes indices & types
+                                ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  ROW = []Cell  (one INSERT row)                                         │
+│  [ Cell{123} , Cell{"a"} , Cell{"b"} ]                                  │
+│     idx 0        idx 1       idx 2                                      │
+│     non-PK         PK          PK                                       │
+└───────────────┬─────────────────────────────┬───────────────────────────┘
+                │                             │
+     row.EncodeKey(schema)          row.EncodeVal(schema)
+     PK cols + table prefix         non-PK cols only
+                │                             │
+                ▼                             ▼
+┌───────────────────────────┐   ┌───────────────────────────┐
+│  KV KEY []byte            │   │  KV VAL []byte            │
+│  link\0 + enc(src) + enc(dst) │  enc(time) only         │
+└───────────────┬───────────┘   └───────────────┬───────────┘
+                │                             │
+                └──────────►  kv.Set(key, val)  (0103–0105)
+                              kv.Get(key) → val
+```
+
+---
+
+### 3. Worked example: `link(time, src, dst)` — PK `(src, dst)`
+
+#### Step A — Define schema (blueprint)
+
+```go
+schema := &Schema{
+    Table: "link",
+    Cols: []Column{
+        {Name: "time", Type: TypeI64}, // index 0 — non-PK
+        {Name: "src",  Type: TypeStr}, // index 1 — PK
+        {Name: "dst",  Type: TypeStr}, // index 2 — PK
+    },
+    PKey: []int{1, 2},
+}
+```
+
+```text
+  idx │ name │ type │ PK?
+  ────┼──────┼──────┼─────
+   0  │ time │ i64  │ no
+   1  │ src  │ str  │ YES
+   2  │ dst  │ str  │ YES
+```
+
+#### Step B — Create row (data)
+
+```go
+row := Row{
+    {Type: TypeI64, I64: 123},
+    {Type: TypeStr, Str: []byte("a")},
+    {Type: TypeStr, Str: []byte("b")},
+}
+```
+
+```text
+Logical:  time=123   src="a"   dst="b"
+          row[0]     row[1]    row[2]
+```
+
+`schema.NewRow()` gives blank cells `{Type:0, ...}` — fill them or build a literal `Row` like above.
+
+#### Step C — Encode (split for KV)
+
+```go
+key := row.EncodeKey(schema)
+val := row.EncodeVal(schema)
+```
+
+**EncodeKey** (loop idx 0→2, only PK columns):
+
+```text
+1. key = "link" + 0x00
+2. idx 0 time → skip (not PK)
+3. idx 1 src  → row[1].Encode(key)  → append [01 00 00 00 'a']
+4. idx 2 dst  → row[2].Encode(key)  → append [01 00 00 00 'b']
+
+KEY = [ l i n k 00 | 01 00 00 00 a | 01 00 00 00 b ]
+```
+
+**EncodeVal** (only non-PK columns):
+
+```text
+1. idx 0 time → row[0].Encode(val)  → [7B 00 00 00 00 00 00 00]  (123 as i64)
+2. idx 1,2    → skip (PK)
+
+VAL = [ 7B 00 00 00 00 00 00 00 ]
+```
+
+#### Step D — Store & read back (later chapters wire `kv.Set`; decode is here)
+
+```go
+// kv.Set(key, val)
+
+out := schema.NewRow()
+out.DecodeKey(schema, key)  // fills row[1], row[2] from key bytes
+out.DecodeVal(schema, val)  // fills row[0] from val bytes
+// out == row
+```
+
+---
+
+### 4. Who calls whom (call chain)
+
+```text
+Application / SQL (later)
+  │
+  ├─ Schema          table definition (Cols, PKey, Table name)
+  ├─ Row []Cell      one row of values
+  │
+  ├─ row.EncodeKey(schema)
+  │     ├─ append schema.Table + 0x00
+  │     └─ for each PK index i: row[i].Encode(key)  ──► Cell (0201)
+  │
+  ├─ row.EncodeVal(schema)
+  │     └─ for each non-PK index i: row[i].Encode(val) ──► Cell (0201)
+  │
+  └─ kv.Set(key, val)  ──► Entry + log + CRC (0103–0105)
+```
+
+---
+
+### 5. Two rows, same table — different keys
+
+Same schema; different PK → different KV keys (same table prefix):
+
+```text
+Row 1: time=123, src="a", dst="b"  →  key = link\0 + enc(a) + enc(b)
+Row 2: time=456, src="a", dst="c"  →  key = link\0 + enc(a) + enc(c)
+                                              └── same prefix ──┘   └── different ──┘
+```
+
+Point lookup: `Get(EncodeKey(row))` finds exactly one row. PK = physical address.
+
+---
+
+### 6. Copy-paste skeleton
+
+```go
+// Blueprint
+schema := &Schema{Table: "link", Cols: [...], PKey: []int{1, 2}}
+
+// One row (Cells align with schema.Cols indices)
+row := Row{
+    Cell{Type: TypeI64, I64: 123},         // Cols[0]
+    Cell{Type: TypeStr, Str: []byte("a")}, // Cols[1] — PK
+    Cell{Type: TypeStr, Str: []byte("b")}, // Cols[2] — PK
+}
+
+// Split for dumb KV
+key := row.EncodeKey(schema)
+val := row.EncodeVal(schema)
+
+// Read back
+out := schema.NewRow()
+out.DecodeKey(schema, key)
+out.DecodeVal(schema, val)
+```
+
+---
+
+### 7. Cheat sheet
+
+| Piece | One-line job |
+| :--- | :--- |
+| `Schema` | Table blueprint: names, types, which column indices are PK |
+| `Row` | `[]Cell` — one value per column |
+| `Cell` | One typed value; `Encode` / `Decode` bytes (0201) |
+| `EncodeKey` | `table\0` + encoded **PK** cells |
+| `EncodeVal` | encoded **non-PK** cells |
+| `DecodeKey` | Strip `table\0`, fill PK cells (set `Type` from schema first) |
+| `DecodeVal` | Fill non-PK cells |
+
+---
+
 ## The Concept & Theory: Tables Are a Mapping Problem
 
 ### The Fundamental Impedance Mismatch
