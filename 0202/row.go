@@ -26,7 +26,13 @@ type Schema struct {
 
 // Encode a Row as KV
 // When user types an SQL to insert into a table, it creates this first like schema.NewRow()
-// {Type: 0, I64: 0, str/int: nil,}
+/* row = [
+  Cell{Type:0, I64:0, Str:nil},
+  Cell{Type:0, I64:0, Str:nil},
+  Cell{Type:0, I64:0, Str:nil},
+]
+This blank state used before DecodeKey / DecodeVal fill values.
+*/
 
 type Row []Cell
 
@@ -39,6 +45,8 @@ func (row Row) EncodeKey(schema *Schema) (key []byte) {
 	// 1. Prefix: table name + null-byte separator.
 	key = append([]byte(schema.Table), 0x00)
 
+	// len(row) # of cells in the row.
+	// len(schema.Cols) # of columns in the schema.
 	check(len(row) == len(schema.Cols))
 
 	for idx, value := range row {
