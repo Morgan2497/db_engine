@@ -11,6 +11,43 @@ SQL string ──parseSelect──► StmtSelect ──(later Exec)──► Enc
 
 ---
 
+## The Concept & Theory: Why an AST at All?
+
+### Bytes In, Structure Out
+
+After lexing/values, you still only have a linear cursor. An **Abstract Syntax Tree (AST)** reifies the *shape* of the statement:
+* which table,
+* which columns to return (projection),
+* which equality predicates identify the row.
+
+The executor should not re-scan SQL text. It should walk a small struct. That boundary — **parser produces AST; executor consumes AST** — is how real engines isolate syntax from runtime.
+
+### Restricting the Grammar Is a Feature
+
+Full SQL `WHERE` is a boolean expression tree (`AND`/`OR`/comparisons/functions). Supporting that demands binding, type checking, and a query planner. By allowing only:
+
+```text
+col = value [AND col = value]*
+```
+
+we guarantee the predicate *is* a primary-key specification (once validated against the schema in 0305). The AST maps onto `EncodeKey` without optimization puzzles.
+
+This is **progressive disclosure**: teach the PK point-query path that optimizers love, before general filters.
+
+### Named Bindings (`NamedCell`)
+
+A bare `Cell` is untyped relative to columns. `NamedCell` pairs **column name + value**, which is exactly what WHERE/SET clauses express in SQL. Execution later resolves names → schema indices (`lookupColumns` / `makePKey`). Keeping names in the AST preserves SQL’s user-facing vocabulary until the catalog binds them.
+
+### Projection vs Selection (Relational Vocab)
+
+In relational algebra:
+* **Selection (σ)** — filter rows (our WHERE).
+* **Projection (π)** — choose columns (our SELECT list).
+
+Even in this tiny engine, `StmtSelect` already separates those ideas: `keys` filter identity; `cols` shape the output. That vocabulary will matter when scans and multiple rows arrive.
+
+---
+
 ## 1. AST Types
 
 ```go

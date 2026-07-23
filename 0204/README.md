@@ -19,6 +19,35 @@ This chapter introduces **`DB`**: a thin relational façade over `KV` that speak
 
 ---
 
+## The Concept & Theory: Façades and Layering
+
+### Why Introduce `DB` at All?
+
+You could call `EncodeKey` + `SetEx` from application code forever. That leaks storage concerns into every caller. The `DB` type is a **façade**: a narrow, intention-revealing API (`Insert`, `Select`, …) that hides byte packing and update modes.
+
+This matches how real drivers feel:
+* Users think in rows and statements.
+* Drivers/engines translate to pages, keys, and slots.
+
+### Point-Lookup Relational Algebra (Tiny Subset)
+
+With only PK access, our relational engine supports a *subset* of what SQL usually implies:
+* **Exact fetch by identity** (clustered primary key lookup)
+* **Projection** will appear fully once SQL SELECT lists arrive (0305)
+* **No scans, joins, or filters on non-key columns** yet
+
+That is not a failure — it is staged complexity. Many production plans *start* with a PK lookup when the optimizer can prove it. We implement that happy path first.
+
+### Partial Rows Are Normal
+
+`Select`/`Delete` often populate **only PK fields** in the `Row`. Non-key slots are empty until `DecodeVal` fills them. That mirrors SQL: `WHERE id=5` does not require you to supply the other columns. Mentally treat a `Row` as a **buffer of slots** keyed by schema index, not always a fully hydrated tuple.
+
+### Idempotency at the Relational Edge
+
+Because `SetEx`/`Del` report whether state changed, `DB` operations can later expose SQL-like row counts (`Updated=1` vs `0`) without inventing new storage semantics. Chapter 0305’s `SQLResult.Updated` sits on this foundation.
+
+---
+
 ## 1. The `DB` Type
 
 ```go

@@ -18,6 +18,66 @@ This chapter adds **Atomicity** (“A”) at the record level: only **complete, 
 
 ---
 
+## The Concept & Theory: Atomicity at the Storage Layer
+
+### What “Atomic” Means Here
+
+In concurrency, “atomic” often means “appears indivisible to other threads.” In crash recovery, **atomic write** means:
+
+> Either the whole record is present and trusted after reboot, or it is as if the write never happened.
+
+Users should never observe a half-applied log entry that corrupts sizes and poisons the in-memory map. That is storage-level atomicity for our append-only design.
+
+### Why Disks Make This Hard
+
+Storage hardware commits data in **sectors** (512 B or 4 KiB). A multi-kilobyte log record spans many sectors. Power loss can commit some sectors and not others. The file size might even include the “failed” space filled with zeros or stale garbage. Your decoder, if naïve, will trust a length field inside that garbage and jump off a cliff.
+
+### Detection vs Prevention
+
+Two philosophical approaches:
+
+| Approach | Idea | Tradeoff |
+| :--- | :--- | :--- |
+| **Prevention** | Double-fsync with a “commit pointer” sector; only advance pointer after data is safe | Strong, but **two** expensive syncs per commit |
+| **Detection** | Store a checksum over the record; on read, verify or discard | One sync; recovery must tolerate a bad tip |
+
+We choose **detection with CRC32**. It matches how many practical log formats work: assume the prefix of the log is good; stop at the first bad record.
+
+### Checksums as Integrity Evidence
+
+A checksum is a compact fingerprint of a byte range. If any bit in the range flips (torn write, bit rot, buggy copy), the recomputed fingerprint almost certainly mismatches.
+
+Why not SHA-256? Cryptographic hashes defend against *adversaries*. We defend against *accidents*. CRC32 is:
+* tiny (4 bytes on the wire),
+* extremely fast,
+* good at catching burst errors and zero-filled torn sectors.
+
+Why not a simple sum? Summing zeros yields zero — a torn page of `NUL` bytes can look “valid.” CRCs are designed so structured garbage rarely verifies.
+
+### Chain Integrity: Why We Stop, Not Skip
+
+Our records are **variable length**. The only way to find record N+1 is to trust record N’s size fields. If record N’s header is corrupt, you cannot safely find N+1. Therefore recovery policy is:
+
+```text
+read → verify → apply → repeat
+              ↘ fail → END OF LOG (ignore the tip)
+```
+
+Skipping ahead would require a different format (fixed-size slots, secondary indexes of offsets, etc.). For a teaching WAL, “prefix is valid; tip may be junk” is the right mental model.
+
+### ACID So Far (Storage Slice)
+
+| Letter | Mechanism in our engine |
+| :--- | :--- |
+| **A**tomicity | CRC + ReadFull; bad tip discarded |
+| **C**onsistency | Still mostly app/schema-level (later) |
+| **I**solation | Not yet (single-threaded mental model) |
+| **D**urability | fsync after append (0104) |
+
+We are building the storage foundations real engines rely on before transactions get fancy.
+
+---
+
 ## 1. Three Torn-Write Failure Modes
 
 Assume we intended to append a 1000-byte record:

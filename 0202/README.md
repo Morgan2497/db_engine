@@ -22,6 +22,47 @@ Logical row                         Physical KV
 
 ---
 
+## The Concept & Theory: Tables Are a Mapping Problem
+
+### The Fundamental Impedance Mismatch
+
+A relational **row** is a tuple of named, typed fields. A KV store is a flat dictionary of byte strings. Bridging them is the central trick of embedded SQL engines (SQLite on its B-tree, Cockroach/TiDB on KV, etc.):
+
+> **Choose which parts of the row become the KV key, and which become the KV value.**
+
+### Primary Key as Physical Address
+
+In our design (and in many clustered-index designs), the **primary key is not just a constraint** — it is the lookup address:
+* Point queries (`WHERE pk = ?`) become a single `Get(EncodeKey(...))`.
+* Uniqueness is “there can be only one value per key.”
+* Non-key columns ride along in the value blob.
+
+Secondary indexes (later) are extra KV mappings from secondary key → primary key (or covering columns). Understanding “PK = key” makes those future structures obvious.
+
+### Why Split Key vs Value?
+
+| Put in **key** | Put in **value** |
+| :--- | :--- |
+| Columns you look up by | Bulky attributes you fetch after lookup |
+| Must be unique (PK) | May change without renaming the row’s address |
+| Participate in sort/order (later) | Usually ignored by the index order |
+
+If you stuffed the entire row into the key, every update would delete+reinsert a longer key (expensive). If you put the PK only in the value, you could not find the row without scanning.
+
+### Table Namespaces and Prefix Isolation
+
+One physical KV often holds **many logical tables**. Prefixing keys with `tableName + 0x00` creates a namespace:
+* `user\0…` never collides with `users\0…` because of the null separator.
+* Future range scans can iterate “all keys for table T” by seeking to `T\0` and stopping at the next prefix.
+
+The null byte is a classic trick: it cannot appear in some string encodings, or is escaped; here table names are plain ASCII identifiers, so `\0` is a safe terminator.
+
+### Schema as Contract
+
+The `Schema` is the **catalog entry** for one table: names, types, PK indices. Encoding/decoding without a schema is impossible in our type-tag-free cell format. That is intentional: the relational layer owns meaning; the KV owns bytes.
+
+---
+
 ## 1. Core Types
 
 ```go

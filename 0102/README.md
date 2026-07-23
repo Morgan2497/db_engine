@@ -16,6 +16,62 @@ This chapter does **not** open files yet. It only defines the **wire format** th
 
 ---
 
+## The Concept & Theory: What Serialization Really Is
+
+In RAM, an `Entry` is a *living* Go value: pointers, lengths, maybe heap-allocated slices living in different places. The CPU can chase those pointers. A disk cannot.
+
+**Serialization** is the act of flattening that living graph into one **linear, self-describing byte sequence** that:
+1. has a defined order (header first, then payloads),
+2. can be written to a file or socket as a contiguous blob,
+3. can be reconstructed later into an equivalent struct (**deserialization**).
+
+Think of packing a suitcase: clothes (fields) are folded into a fixed packing order so that when you unpack in another city (another process, another reboot), you get the same outfit back.
+
+### Why Databases Invent Their Own Formats
+
+You *could* serialize with JSON or Gob. Teaching engines usually avoid that for the storage path because:
+
+| Format | Pros | Cons for a storage engine |
+| :--- | :--- | :--- |
+| JSON | Human-readable | Large, slow to parse, ambiguous number types |
+| Gob / protobuf | Convenient | Extra dependency; harder to teach byte-level control |
+| **Custom binary** | Compact, explicit, fast | You must design the layout carefully |
+
+Our custom layout is tiny and educational: two length prefixes + payloads. Every later durability feature (log append, CRC, torn-write detection) builds on “I know exactly how many bytes this record occupies.”
+
+### Self-Describing Records & Framing
+
+A file is just a river of bytes. If you dump `key` then `val` with no lengths:
+
+```text
+key="ab" val="cd"  →  a b c d
+key="a"  val="bcd" →  a b c d
+```
+
+Those two records are **byte-identical**. The decoder cannot tell where the key ended. Length prefixes (or other **framing**) solve that by announcing sizes *before* the variable payloads. This is the same idea as:
+* HTTP `Content-Length`
+* Protobuf length-delimited fields
+* Many DB page/slot formats
+
+### Streams vs Slices (`io.Reader`)
+
+`Encode` returns a finished `[]byte` — easy to reason about. `Decode` takes an `io.Reader` because real I/O is a **stream**:
+* You may not have the whole file in memory.
+* You may be reading record-after-record from a growing log.
+* The reader has a **cursor**; each successful read advances it.
+
+That is why Decode first reads a fixed-size **header buffer**, learns `keySize`/`valSize`, then reads exact payload sizes. Framing turns an infinite byte river into discrete messages.
+
+### Little-Endian Theory (Brief)
+
+Endianness is the byte order of multi-byte integers:
+* **Little-endian:** least significant byte at the lowest address (`2` → `02 00 00 00`)
+* **Big-endian:** most significant byte first (`2` → `00 00 00 02`)
+
+We use little-endian here because it matches common CPU memory layout and is fine for a local log. Later, when keys must **sort** correctly under `bytes.Compare`, we will often prefer **big-endian** so the first byte carries the highest place value. Serialization format is never “just bytes” — it encodes *policy* (speed vs sortability vs portability).
+
+---
+
 ## 1. The Wire Format (Skeleton Layout)
 
 Every serialized entry is one contiguous blob:
