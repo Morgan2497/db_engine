@@ -13,6 +13,31 @@ letter / _      →    tryName (0301)        →    identifier (not a Cell)
 
 ---
 
+## The Concept & Theory: Predictive (LL(1)) Parsing
+
+### One Token of Lookahead
+
+A grammar is **LL(1)**-friendly when the next symbol uniquely decides which production to use. For literals:
+
+* If you see a digit or sign → you are parsing an integer.
+* If you see a quote → you are parsing a string.
+
+You do not need to guess and heavily backtrack. That keeps the parser simple, fast, and easy to debug — ideal for a teaching SQL subset.
+
+### Values Are Already Storage-Ready
+
+`parseValue` does not produce an abstract “literal AST node” that later needs conversion. It fills a **`Cell`** — the same typed unit Encode already understands. That collapses “parse time” and “storage type system” into one representation and avoids a second conversion pass.
+
+### Escapes Break Zero-Copy (And That Is OK)
+
+A string without escapes can be a slice of `buf`. The moment you see `\'`, the output bytes differ from the source bytes, so you must allocate and rebuild. Engines accept that cost because escaped strings are rarer than bare identifiers and integers. The design principle: **stay zero-copy until correctness forces a copy**.
+
+### Keywords vs Identifiers
+
+`tryKeyword` must ensure a keyword is not a prefix of a longer name (`select` vs `selections`). The separator check is lexical theory meeting SQL reality: reserved words are context-sensitive spellings of identifiers, not separate character classes.
+
+---
+
 ## 1. New Lexer Helpers
 
 | Helper | Role |

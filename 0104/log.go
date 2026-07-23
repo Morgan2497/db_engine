@@ -23,7 +23,7 @@ func (log *Log) Write(ent *Entry) error {
 	if _, err := log.fp.Write(ent.Encode()); err != nil {
 		return err
 	}
-	return log.fp.Sync()
+	return log.fp.Sync() // fsync
 }
 
 func (log *Log) Read(ent *Entry) (eof bool, err error) {

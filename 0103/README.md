@@ -20,6 +20,77 @@ This chapter adds **persistence** with an **append-only log**. Instead of editin
 
 ---
 
+## The Concept & Theory: The Write-Ahead / Append-Only Idea
+
+### The Problem with “Update in Place”
+
+Imagine the database stores `user → Morgan` at byte offset 1000 on disk. An update to `Morgan Kim` might overwrite those same bytes. If power fails halfway through the overwrite, you do not have the old value *or* the new value — you have **garbage**. That is catastrophic for a system that promises correctness.
+
+**Append-only** storage refuses to edit history. Every mutation becomes a new fact written at the end of a file:
+
+```text
+…[old facts…][new fact]
+                 ▲
+                 └── the only place we write
+```
+
+Old bytes remain readable. After a crash, you replay from the beginning (or from a checkpoint) and rebuild state. You may lose the *last incomplete* append (handled better in 0104/0105), but you do not destroy earlier committed history by overwriting it.
+
+This idea is the ancestor of:
+* **Write-Ahead Logging (WAL)** in Postgres/MySQL/SQLite
+* **Commit logs** in Kafka-style systems
+* **MemTable + SSTable** pipelines in LSM-trees (append-heavy by design)
+
+### Log as Source of Truth, Mem as Cache
+
+Two different roles:
+
+| Structure | Question it answers | Nature |
+| :--- | :--- | :--- |
+| **Log file** | “What happened, in order?” | Durable history (eventually) |
+| **`kv.mem` map** | “What is true *right now*?” | Derived, volatile snapshot |
+
+On boot, the map is empty and worthless until replay. After replay, Reads hit the map (fast). Writes hit the log first (durable intent), then the map (fast future reads).
+
+This separation is a classic systems pattern: **materialize a cache from an authoritative log**.
+
+### Why “Log First, Then Memory”?
+
+Order matters for crash safety:
+
+```text
+Safe order:     disk append  →  update mem
+Unsafe order:   update mem   →  disk append
+```
+
+If you update memory first and crash before the disk write, reboot replays an old log and **loses** the change you already “accepted” in RAM. If you write the log first and crash before updating memory, reboot replays the log and **recovers** the change. The log is the truth; memory is a convenience.
+
+### Tombstones: Deletion as a Positive Fact
+
+In an append-only world, “delete” cannot mean “scrub bytes off disk.” Deletion is recorded as another event: a **tombstone** (`deleted=true`). During replay, seeing a tombstone means “this key should not exist in the latest snapshot.”
+
+This is the same concept used in:
+* LSM stores (tombstone markers until compaction)
+* Distributed stores (delete records that must propagate)
+
+Compaction (later) can eventually drop obsolete sets/tombstones to reclaim space. Until then, the log may contain many superseded versions of the same key — that is expected.
+
+### Beyond Durability: Why Logs Are So Powerful
+
+Because a log is an ordered sequence of state transitions, it is also a substrate for:
+
+* **Replication:** ship the same byte stream to followers; they replay and converge.
+* **Time travel / audit:** inspect historical entries (with caveats).
+* **Crash recovery:** rebuild RAM deterministically.
+
+The cost is well-known: logs grow without bound if never compacted, and cold start replay gets slower. That is why this chapter calls the log **auxiliary** — a permanent engine eventually folds log history into a primary structure (B-tree / SSTables). For now, the log *is* the primary durable store.
+
+### Sequential I/O Advantage
+
+Hard drives and even SSDs prefer **sequential** writes (append to end) over random overwrites scattered across the file. Append-only designs turn random logical updates into sequential physical writes — a major reason WALs and LSM trees dominate modern storage engines.
+
+---
+
 ## 1. Why Append-Only?
 
 | Approach | Problem |

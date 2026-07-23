@@ -16,6 +16,34 @@ Return type is `interface{}` (polymorphic AST). Chapter 0305 will `type switch` 
 
 ---
 
+## The Concept & Theory: Statement Dispatch & DDL vs DML
+
+### SQL Verb Families
+
+| Family | Examples | Effect |
+| :--- | :--- | :--- |
+| **DDL** (Data Definition) | `CREATE TABLE` | Changes catalog/schema metadata |
+| **DML** (Data Manipulation) | `INSERT`/`UPDATE`/`DELETE` | Changes row data |
+| **DQL** (Data Query) | `SELECT` | Reads data; no durable mutation |
+
+Parsers usually share one entry point (`parseStmt`) that classifies the verb early. Executors then branch on AST type. Keeping parse and execute separate means you can unit-test parsing without opening a database.
+
+### Recursive Descent & LL(k)
+
+Our style is **recursive descent**: each grammar rule is roughly one function (`parseInsert`, `parseWhere`, …). For multi-word keywords (`CREATE TABLE`) we need more than one token of lookahead → LL(k) with explicit save/rollback of `pos`.
+
+This is how many production SQL parsers begin (before or beside generated parsers). You trade generator complexity for clarity and control.
+
+### Why `interface{}` AST Nodes?
+
+Go lacks a sealed class hierarchy. Returning `interface{}` (or a small interface with no methods) lets `parseStmt` yield different concrete structs. The executor’s `type switch` is the moral equivalent of a visitor. Later you might introduce a `Statement` interface; the teaching point is polymorphism at the parse/execute boundary.
+
+### Catalog Thinking Starts at CREATE
+
+`StmtCreateTable` is not “just another statement.” It defines the **schema contract** future DML needs. Even before 0305 persists it, understand: without CREATE (or equivalent catalog load), typed Encode/Decode has nothing to obey.
+
+---
+
 ## 1. AST Zoo (Skeleton Cards)
 
 ### CREATE TABLE

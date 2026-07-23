@@ -5,6 +5,18 @@ Chapter 0103 appends encoded entries to a log file. That feels durable — until
 
 On modern OSes, a successful `Write()` usually means: **bytes landed in the Page Cache (RAM)**. The physical SSD/HDD may still be empty. Pull the power plug → those bytes evaporate.
 
+Each file write does not directly map to a disk write. The OS has a memory cache. Writes
+go to the cache first, then are synced to disk later. This allows merging repeated writes and
+improves throughput. Repeated reads also benefit.
+This cache is called the page cache. The page here matches the CPU virtual memory page.
+A page is the smallest unit of IO, with a fixed size (usually 4K or 16K). You may ask how
+disk IO cache relates to virtual memory. Look into mmap. Also note that database docs often
+call B-tree nodes “pages”. Do not confuse them.
+Besides the page cache, disks may also have their own RAM cache. To ensure data reaches
+disk, an operation must flush all cache layers and wait for completion. This is the fsync
+syscall on Linux.
+
+In Go, call it via Sync() on *os.File.
 ```text
 What you think happens:
   app.Write() ──────────────────────────────►  physical disk
@@ -16,6 +28,52 @@ What actually happens:
 ```
 
 This chapter implements **Durability** (the “D” in ACID) with `fsync`: force the OS to flush file data (and, on Unix, directory metadata) to hardware before we claim success.
+
+---
+
+## The Concept & Theory: Durability and the OS Lie
+
+### ACID’s “D” in Plain Language
+
+**Durability** means: once the database acknowledges a successful write, that write must remain observable after a crash, power loss, or reboot. Users build banking apps and shopping carts on that promise. If `Set` returns success but a brownout erases the bytes, the contract is broken — even if your Go code looked correct.
+
+### Why Operating Systems Delay Disk Writes
+
+Physical I/O is orders of magnitude slower than RAM. To keep the whole machine fast, kernels implement a **page cache**:
+* `write()` copies into RAM pages marked **dirty**.
+* The kernel later flushes dirty pages in large, efficient batches.
+* From the app’s perspective, `write()` already “succeeded.”
+
+That design is excellent for text editors and compilers. It is dangerous for databases, because “success” was measured against **volatile** memory, not **persistent** media.
+
+There may be *another* cache inside the disk controller (write-back caching). True durability sometimes also needs drive-level flush commands; `fsync` is the portable application-level barrier that asks the OS to push data down as far as the platform guarantees.
+
+### `fsync` as a Happens-Before Barrier
+
+Think of `fsync` / `File.Sync()` as a synchronization fence:
+
+```text
+bytes may be only in RAM  ──Sync()──►  bytes must be on stable storage
+         (before)                         (after returns)
+```
+
+Until `Sync` returns, you must not tell the user “committed.” After it returns, a process crash should not lose that record (hardware failure aside).
+
+### Group Commit (Why Naive Per-Write Sync Is Expensive)
+
+Calling `fsync` on every tiny record is correct but slow (thousands of syncs/sec vs millions of writes/sec into the page cache). Production engines often use **group commit**: buffer many transactions, then one `fsync` covers the batch. Our teaching engine syncs per write for clarity — the *principle* is the same: durability has a latency cost.
+
+### Files vs Directories: Two Persistence Domains
+
+On Unix, creating a file updates:
+1. **inode / data blocks** — the file’s contents
+2. **directory entries** — the name → inode mapping
+
+You can fsync (1) and still lose (2) on crash → an **orphan inode**: data exists but no path reaches it. That is why `createFileSync` also syncs the parent directory. Databases that rename `wal.tmp` → `wal` face the same rule: rename is a directory operation and needs directory durability.
+
+### Durability Without Atomicity Is Incomplete
+
+Even after this chapter, a crash *during* the synced write can leave a **partial last record**. Durability says “what was fully synced stays.” It does not say “the last attempt was all-or-nothing.” That gap is **Atomicity**, fixed next with checksums.
 
 ---
 

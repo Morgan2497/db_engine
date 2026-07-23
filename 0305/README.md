@@ -25,6 +25,56 @@ ExecStmt() ──► GetSchema → makeRow/makePKey → KV → SQLResult
 
 ---
 
+## The Concept & Theory: Binding, Catalogs, and Execution
+
+### The Missing Middle: Name → Physical
+
+Parsing gives you strings like table `"link"` and column `"time"`. Storage wants byte keys and integer offsets. **Binding** (catalog lookup) connects them:
+
+```text
+SQL names ──GetSchema / lookupColumns──► Schema indices / types ──Encode*──► KV bytes
+```
+
+Without a catalog, the executor cannot know that `src` is PK column 1 or that `time` is `int64`. `GetSchema` is our catalog API; `@schema_*` keys are the durable catalog store.
+
+### Why Persist Schemas in the Same KV?
+
+Metadata is data. If schemas lived only in a sidecar file with weaker durability, you could recover rows whose types you no longer understand. Storing JSON schemas in the same checksummed, fsynced log means:
+* reboot reloads table definitions,
+* backup/copy of the KV file keeps data+meaning together,
+* the engine remains a single storage universe.
+
+(Production catalogs are more sophisticated — system tables, versions — but the idea rhymes.)
+
+### Executor as Interpreter of ASTs
+
+`ExecStmt` is an **interpreter**:
+* switch on statement kind,
+* validate against schema,
+* call into the relational/KV APIs from 020x,
+* package outcomes as `SQLResult`.
+
+There is not yet a separate optimizer producing multiple plan alternatives. For PK point queries, the “plan” is obvious: one Get/SetEx/Del. When range scans arrive, planning becomes a real subject; the AST→executor seam stays the same.
+
+### Read-Modify-Write Updates
+
+SQL `UPDATE … SET non_key = ? WHERE pk = ?` cannot rewrite only one column on disk unless the file format has per-column slots. Our value blob is a contiguous encoding of all non-PK cells. Therefore execution:
+1. reads the full row,
+2. patches fields in RAM,
+3. writes the full value back.
+
+That RMW pattern is ubiquitous. PK immutability follows: changing the key would change the row’s address — conceptually a delete plus insert, which we refuse in `fillNonPKey` for safety/clarity.
+
+### The Vertical Slice Milestone
+
+With 0305 complete, the project finally demonstrates an end-to-end database loop:
+
+> text SQL → parse → bind → durable typed storage → typed result
+
+Everything before was a necessary organ; this chapter is the first time the organism walks. Later chapters deepen organs (ordering, indexes, scans) without throwing away this loop.
+
+---
+
 ## 1. Unified Result Shape
 
 ```go

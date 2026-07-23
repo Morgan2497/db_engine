@@ -21,6 +21,40 @@ UPSERT  ──ModeUpsert──►  SetEx
 
 ---
 
+## The Concept & Theory: Semantics Belong Near the Data
+
+### SQL Is Not “Just CRUD Bytes”
+
+From a naïve storage view, every write is an overwrite. From a SQL view, writes carry **intent**:
+* `INSERT` asserts “this identity must be new.”
+* `UPDATE` asserts “this identity must already exist.”
+* Upsert asserts “make it so, regardless.”
+
+If the storage API only offers blind `Set`, the SQL layer must invent those semantics with a read-modify-write cycle. That is not only slower — it is **racy** once you have concurrent writers: two Inserts can both `Get` miss, then both `Set`, and you silently lose uniqueness.
+
+### Push Predicates Down (A Database Motif)
+
+A recurring database systems theme: **evaluate conditions as close to the data as possible**.
+* Query predicates push into index range scans.
+* Storage engines expose conditional puts (`compare-and-swap`, `put-if-absent`).
+
+`SetEx` is our tiny version of that motif: existence checks happen at the map/leaf in **one** traversal, with a mode flag describing SQL intent.
+
+### Return Values as Observable Semantics
+
+`updated bool` is part of the semantic contract:
+* Insert on conflict → `false` (caller / SQL can turn this into an error or “0 rows”).
+* Update on miss → `false`.
+* Upsert with identical bytes → `false` (idempotent; may skip logging).
+
+Engines carefully define whether “no-op success” is an error or a zero row count. Teaching `bool` early forces you to think about that distinction before SQL error codes arrive.
+
+### Preparing for Trees and LSM Leaves
+
+Today the “one traversal” benefit is a map lookup. Tomorrow, when keys live in a B-tree or memtable, the same API still matters: you pay for path descent once, then decide insert vs reject at the leaf. Designing `SetEx` now avoids painting the SQL layer into a Get+Set corner.
+
+---
+
 ## 1. The `UpdateMode` Enum
 
 ```go

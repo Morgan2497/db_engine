@@ -21,6 +21,54 @@ Before SQL, schemas, logs, or disks, every database engine needs a **storage ker
 
 ---
 
+## The Concept & Theory: Why Start with a KV Store?
+
+A production database (Postgres, MySQL, SQLite, RocksDB) looks enormous from the outside: SQL parsers, optimizers, transactions, indexes, replication. Underneath almost all of them is a simpler idea:
+
+> **Associate an opaque key with an opaque value, and retrieve that value later.**
+
+That idea is the **Key-Value (KV) abstraction**. Everything fancy in later chapters is either:
+1. a way to *encode* richer data (rows, integers, schemas) into those opaque bytes, or
+2. a way to make that association *survive crashes*, *sort correctly*, or *scale on disk*.
+
+### Why not start with SQL tables?
+
+If we began with `CREATE TABLE` and `SELECT`, we would mix three hard problems at once:
+* **Meaning** — what is an integer vs a string?
+* **Language** — how do we parse SQL text?
+* **Storage** — where do bytes live, and how do we find them?
+
+By isolating a dumb KV first, we get a stable **storage contract**. Higher layers can change (new SQL features, new indexes) without rewriting the basement. This is the same layering philosophy used by LSM engines (LevelDB/RocksDB) and by SQLite’s pager/B-tree split: keep the physical store simple and push intelligence upward.
+
+### Volatility vs Durability (The Mental Model)
+
+| Medium | Speed | Survives power loss? | Role in 0101 |
+| :--- | :--- | :---: | :--- |
+| CPU registers / L1 cache | Fastest | No | Not our concern yet |
+| **RAM (`kv.mem`)** | Very fast | **No** | Entire database lives here |
+| SSD / HDD | Slow | Yes | Deferred to 0103+ |
+
+RAM is **volatile**: it requires continuous power. When the process exits or the machine reboots, every map entry disappears. That sounds like a defect, but it is a deliberate teaching step. You cannot appreciate logs, `fsync`, and checksums until you feel what “data only in RAM” really means.
+
+### Hash Map as the First Index
+
+We use Go’s `map` because it gives average **O(1)** Get/Set/Del. Conceptually it is already a tiny “index”:
+* You never scan every key to find one key.
+* You trade memory and hashing for speed.
+
+Real databases later replace (or supplement) hash maps with **ordered** structures (B-Trees, LSM SSTables) so they can answer *range* questions (`WHERE id > 10`). A hash map cannot do ranges efficiently — keys are unordered. Remember that limitation; chapters 040x exist largely to fix it.
+
+### Idempotency and “Did State Change?”
+
+`Set` returning `updated=false` when the value is identical is not a pedantic detail. In databases, many layers care whether a write was a **no-op**:
+* Avoid appending redundant log records (waste space, slow recovery).
+* Replication can skip no-ops.
+* SQL `UPDATE` row counts often reflect *actually changed* rows.
+
+So from day one, mutations report **whether the logical state changed**, not merely “the call returned without error.”
+
+---
+
 ## 1. The Data Structure
 
 ```go

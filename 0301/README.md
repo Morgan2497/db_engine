@@ -13,6 +13,39 @@ This chapter: **identifiers only**. No keywords yet, no literals, no statements.
 
 ---
 
+## The Concept & Theory: Databases as Compilers
+
+### The Pipeline Every Engine Shares
+
+Executing `SELECT …` is not magic. It is a classic compiler pipeline specialized for data:
+
+```text
+characters → tokens → syntax tree (AST) → (bind/analyze) → plan → execute
+   lexer        parser         catalog           optimizer    executor
+```
+
+Chapter 0301 is only the leftmost box. If tokenization is wrong, every later stage inherits confusion (`selections` mistaken for `select`, broken identifiers, etc.).
+
+### Why Hand-Write a Lexer Instead of Regex?
+
+Regex is fine for scripts; engines care about:
+* **Performance** — queries are hot paths; allocation and backtracking hurt.
+* **Precise error positions** — `pos` is already a source location.
+* **Streaming control** — commit/rollback of `pos` for lookahead.
+* **Zero-copy tokens** — return `buf[i:j]` slices into the original string.
+
+Production systems (Postgres scanner, SQLite tokenizer) are hand-written for the same reasons.
+
+### Maximal Munch (Longest Match)
+
+Lexer theory says: when multiple token rules could apply, take the **longest** match. That is why `selections` is one identifier, not keyword `select` plus `ions`. Keywords are usually recognized *after* reading an identifier, by checking the spelling **and** a separator boundary — otherwise `selectx` would incorrectly become a keyword.
+
+### Zero-Copy as an Engineering Ethic
+
+Copying every token into a new string doubles memory traffic. Slices share the underlying `buf`. The tradeoff: tokens are only valid while `buf` lives (true for a single query string). That fits SQL perfectly — parse one statement, execute, discard.
+
+---
+
 ## 1. The Zero-Copy Cursor
 
 ```go

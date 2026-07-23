@@ -14,6 +14,49 @@ Storage layer (010x)              Relational layer (020x+)
 
 ---
 
+## The Concept & Theory: The Relational Layer Begins
+
+### Two Layers, Two Languages
+
+By 0105 we have a trustworthy KV basement: durable, append-only, checksummed. It still speaks only **bytes**. Humans and SQL speak **types**: “this column is an integer; that one is a string.”
+
+The **relational / logical layer** is responsible for:
+* defining what values *mean*,
+* encoding them into bytes the KV can store,
+* decoding bytes back into values for queries.
+
+If we forced the KV to understand `int64` vs `string`, every new type would infect the storage engine. Instead we keep KV dumb and teach cells to encode themselves — the same decoupling that lets RocksDB store whatever higher layers write.
+
+### Why a `Cell` Instead of `interface{}`?
+
+Go’s `any` / `interface{}` boxes values on the heap and needs type assertions everywhere. A database hot path encodes millions of values; predictability matters. A concrete `Cell` struct with a type tag is:
+* explicit about the closed set of supported types,
+* friendly to the CPU (no interface indirection),
+* easy to serialize with a `switch`.
+
+This is the “poor man’s sum type”: one struct, one active payload field depending on `Type`.
+
+### Schema-Supplied Types (No Type Tag on the Wire)
+
+Notice Encode does **not** write `Type` into the byte stream. The layout for an int is just 8 bytes; for a string, length+data. That only works if the **reader already knows** which type comes next — knowledge that will live in the table **schema** (0202). Putting types only in the schema saves space and avoids redundancy, at the cost of “bytes alone are meaningless without the blueprint.”
+
+That is normal in relational engines: a page of integers is just integers because the catalog said so.
+
+### Allocation Discipline (`toAppend` / `rest`)
+
+Databases are allergic to needless allocations (GC pressure, CPU). Two patterns appear here that show up everywhere in engine code:
+
+1. **Append into an existing buffer (`toAppend`)** — build a whole row with one growing slice instead of concatenating many tiny ones.
+2. **Return the unconsumed tail (`rest`)** — decode a stream of cells without copying the remainder.
+
+These are small APIs with large consequences once rows have dozens of columns.
+
+### Two’s Complement Reminder
+
+We store `int64` by casting to `uint64` and writing little-endian bits. Negative numbers use **two’s complement** (high bit set). That is fine for *value* payloads. It is *not* fine for *sortable index keys* without further transforms (see 0403’s MSB flip). 0201 is about representing values correctly, not about ordering them in an index.
+
+---
+
 ## 1. The `Cell` Union
 
 ```go
