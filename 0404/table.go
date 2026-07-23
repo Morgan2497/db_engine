@@ -16,6 +16,84 @@ type SQLResult struct {
 	Header []string 
 	Values []Row
 }
+
+type RowIterator struct {
+	schema *Schema
+	iter *KVIterator
+	valid bool // decode result (err != ErrOutofRange), a cached boolean telling if the last move was successful.
+	row Row // decode result, a cached Go struct (row) holding the fully decoded row data.
+}
+
+// Is iteration finished? (Direct boolean read in RAM)
+func (iter *RowIterator) Valid() bool {return iter.valid}
+
+// Current row accessor (Direct struct read in RAM)
+func (iter *RowIterator) Row() Row {return iter.row}
+
+func (iter *RowIterator) Next() (err error) {
+	if err = iter.iter.Next(); err != nil {
+		return err
+	}
+	iter.valid, err = decodeKVIter(iter.schema, iter.iter, iter.row)
+	return err
+}
+
+// Helper (translator) that sits between the physical storage engine and the relational row struct.
+/*
+It does three things.
+1. Check if the raw iterator is valid.
+2. Decode and verify the key.
+3. Decode the value.
+*/
+func decodeKVIter(schema *Schema, iter *KVIterator, row Row) (bool, error) {
+	// 1. Check if the raw KV cursor is even active.
+	if !iter.Valid() {
+		return false, nil
+	}
+
+	// 2. Extract and decode the raw key, checking table boundaries.
+	key := iter.Key()
+	if err := row.DecodeKey(schema, key); err != nil {
+		if errors.Is(err, ErrOutOfRange) {
+			return false, nil // hits table boundary.
+		}
+		return  false, err // error occured.
+	}
+
+	// 3. Extract and decode the value payload for remaining columns.
+	val := iter.Val()
+	if err := row.DecodeVal(schema, val); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// the entry point that brdiges relational Row, encodes it in to raw bytes, asks the storage to find the pos.
+func (db *DB) Seek(schema *Schema, row Row) (*RowIterator, error) {
+	// 1. Translate the target relational row into an order-preserving byte key.
+	key := row.EncodeKey(schema)
+	
+	// 2. Position the physical storage curosr at the first key >= target.
+	kvIter, err := db.KV.Seek(key)
+	if err != nil {
+		return nil, err
+	}
+
+	// 3. Initialize our cached state wrapper (RowIterator)
+	iter := &RowIterator {
+		schema: schema,
+		iter: kvIter,
+		row: schema.NewRow(),
+	}
+	
+	// 4. Immediately decode and validate the intial pos.
+	iter.valid, err = decodeKVIter(schema, kvIter, iter.row)
+	if err != nil {
+		return nil, err
+	}
+	return iter, nil
+}
+
 func (db *DB) Open() error {
 	db.tables = map[string]Schema{}
 	return db.KV.Open()

@@ -1,83 +1,107 @@
-# Step 0104: Fsync & Data Durability
+# Chapter 0104: Fsync & Data Durability
 
-> **Overview:** Writing data to a file does not mean the data is physically on the hard drive. Operating Systems use volatile memory caches to delay writes for performance. In this step, we implement `fsync` (File Sync) to forcefully bypass these caches, guaranteeing absolute **Durability** so our database survives sudden power loss.
+## Overview: “Written” Is Not the Same as “On Disk”
+Chapter 0103 appends encoded entries to a log file. That feels durable — until you learn what `Write()` actually does.
 
-## Core Architectural Concepts
+On modern OSes, a successful `Write()` usually means: **bytes landed in the Page Cache (RAM)**. The physical SSD/HDD may still be empty. Pull the power plug → those bytes evaporate.
 
-### 1. The Illusion of Disk I/O (The Page Cache)
-When an application calls a standard file `Write()` operation, the Operating System does **not** immediately spin up the physical hard drive. Physical disk I/O is incredibly slow. Instead, the OS writes your data into a hidden layer of volatile RAM called the **Page Cache**. 
+```text
+What you think happens:
+  app.Write() ──────────────────────────────►  physical disk
 
-* **The Benefit:** By holding writes in RAM, the OS can merge hundreds of tiny writes into one large, efficient disk write later. It massively improves system throughput.
-* **The Danger:** If the server loses power while your data is sitting in the Page Cache, the RAM is wiped. Your file might disappear entirely, or become corrupted (filled with `0x00` null bytes).
+What actually happens:
+  app.Write() ──► OS Page Cache (RAM) ──?──►  physical disk
+                       ▲
+                       │  power loss here = data gone
+```
 
-The Page Cache is a core component of the operating system's kernel that uses unused volatile RAM to store copies of disk data pages that purposely minimizes direct interaction with physical storage. 
-It acts as a transparent buffer between applications and the physical disk. When an application requests data (read) or saves data (write), the OS handles the operation in RAM first. 
-
-* Reads: If read requested, that's good because data is already in the cache, the OS returns it immediately from RAM, avoiding a slow disk seek. 
-
-* Writes: The OS copies the data into the cache and marks these memory pages as "dirty". The data is considered written from the application's perspective, but it has not yet reached the physical disk. 
-
-### 2. The Database Durability Contract
-A fundamental rule of database engineering is **Durability**. The database must guarantee that once it tells a user "Success, your data is saved," that data will absolutely survive a pulled power plug. 
-
-Because the OS Page Cache and the Hard Drive's own internal hardware caches are volatile, standard `Write()` calls are not enough to fulfill this contract. 
-
-### 3. The `fsync` System Call
-To guarantee durability, an application must issue a strict command to the OS: *"Take this specific file, flush it out of your RAM caches, force the physical disk to write it, and do not let my program continue until the disk hardware confirms it is done."*
-
-In Linux/Unix, this system call is `fsync`. In Go, it is exposed as the `Sync()` method on an `os.File`.
+This chapter implements **Durability** (the “D” in ACID) with `fsync`: force the OS to flush file data (and, on Unix, directory metadata) to hardware before we claim success.
 
 ---
 
-## The Hidden Trap: Directory Fsyncing
+## 1. The Page Cache Illusion
 
-Flushing the data inside the file is only half the battle. We also have to ensure the file *exists*. 
+| Operation | Where data lives after success |
+| :--- | :--- |
+| `fp.Write(bytes)` | Often only in **volatile RAM** (dirty pages) |
+| `fp.Sync()` / `fsync` | OS + drive confirm data on **non-volatile media** |
 
-### How Unix Filesystems Work
-On Unix/Linux systems, a file is actually split into two parts:
-1. **The Data:** The actual bytes inside the file.
-2. **The Metadata (Directory Entry):** The file's name and its pointer, which are recorded inside the parent directory folder. 
+**Benefit of the cache:** merge many tiny writes into fewer large disk I/Os → huge throughput.  
+**Danger for databases:** “Success” without fsync is a lie under power loss.
 
-If you create a brand new log file and sync its *data* to disk, but the system crashes before the parent directory updates its *metadata*, the file will become an invisible "orphan." The data is physically on the disk, but the OS doesn't know the file exists because the directory folder wasn't saved!
-
-**The Rule:** Creating, renaming, or deleting a file requires you to `fsync` the **parent directory folder** itself. (Note: Windows handles this automatically, but Unix requires explicit instruction).
+```text
+┌──────────────┐     Write()      ┌──────────────┐     Sync()     ┌────────────┐
+│  Application │ ───────────────► │  Page Cache  │ ─────────────► │   Disk     │
+│  Log.Write   │                  │  (volatile)  │                │ (durable)  │
+└──────────────┘                  └──────────────┘                └────────────┘
+```
 
 ---
 
-## Technical Implementation
+## 2. The Durability Contract
 
-### 1. File Descriptors (Unix Basics)
-To interact with anything at a low level in Unix, the OS gives you a number called a **File Descriptor (fd)**. It acts as an ID badge for open files, directories, or network connections. We must use raw system calls (`syscall`) to get a file descriptor for our parent directory so we can sync it.
+> Once the database returns success for a write, that data must survive a pulled power cord.
 
-- File Descriptor: It is a unique identifier for a file or other input/output resource, such as a pipe or network socket. It typically has non-negative integer values, with negative values being reserved to indicate "no value" or error conditions.
+Standard `Write()` cannot fulfill this. We must issue:
 
+> “Flush this file out of RAM caches, force the disk to write it, and **do not return** until hardware confirms.”
 
-### 2. Implementing the Directory Sync
-Because Go's standard library does not have a built-in method for syncing directories, we must build a custom function wrapping raw OS system calls:
+In Go: `os.File.Sync()` → Unix `fsync`.
+
+---
+
+## 3. The Hidden Trap: Directory Metadata
+
+A Unix file is two things:
+
+```text
+┌─────────────────────────────────────────────┐
+│  Parent directory                           │
+│  ┌───────────────────────────────────────┐  │
+│  │  name "db.log"  ──pointer──► inode     │  │  ← METADATA
+│  └───────────────────────────────────────┘  │
+└─────────────────────────────────────────────┘
+                      │
+                      ▼
+              ┌──────────────┐
+              │  file bytes  │  ← DATA
+              └──────────────┘
+```
+
+| You fsynced… | Crash before directory sync | Result |
+| :--- | :--- | :--- |
+| File **data** only | Directory entry never hit disk | **Orphan file** — data on disk, OS can’t find the name |
+| File data **and** parent directory | — | File exists and is findable after reboot |
+
+**Rule:** Creating, renaming, or deleting a file on Unix requires `fsync` on the **parent directory** too. (Windows typically handles this for you.)
+
+---
+
+## 4. Skeleton Implementation
+
+### Sync the parent directory
 
 ```go
-import (
-    "os"
-    "path"
-    "syscall"
-)
-
 func syncDir(file string) error {
-    // Open the parent directory specifically as a read-only directory
     flags := os.O_RDONLY | syscall.O_DIRECTORY
     dirfd, err := syscall.Open(path.Dir(file), flags, 0o644)
     if err != nil {
         return err
     }
-    defer syscall.Close(dirfd) // Always close file descriptors to prevent memory leaks
-
-    // Force the physical disk to save the directory metadata
+    defer syscall.Close(dirfd)
     return syscall.Fsync(dirfd)
 }
 ```
 
-### 3. Safe File Creation
-We wrap the standard `os.OpenFile` in a custom function that automatically handles the directory sync every time a new log file is generated:
+```text
+file path:  /var/data/engine.log
+                │
+                └── path.Dir → /var/data
+                                 │
+                                 └── open as directory fd → Fsync(fd)
+```
+
+### Safe create + open
 
 ```go
 func createFileSync(file string) (*os.File, error) {
@@ -85,39 +109,85 @@ func createFileSync(file string) (*os.File, error) {
     if err != nil {
         return nil, err
     }
-    
-    // Ensure the new file's existence is permanently recorded in the parent folder
     if err = syncDir(file); err != nil {
         _ = fp.Close()
         return nil, err
     }
-    
-    return fp, err
+    return fp, nil
 }
 ```
 
-### 4. Updating the Log Interface
-Finally, we update our database `Write` and `Open` methods to utilize these new safety mechanisms:
+### Durable log write
 
-```go
-func (log *Log) Open() (err error) {
-    // Replace standard os.OpenFile with our durable custom function
-    log.fp, err = createFileSync(log.FileName)
-    return err
-}
+```text
+Log.Write(entry):
+  1. Encode entry → []byte
+  2. fp.Write(bytes)     // into page cache
+  3. fp.Sync()           // force to disk  ← NEW in 0104
+```
 
-func (log *Log) Write(ent *Entry) error {
-    // 1. Write to the OS Page Cache
-    if _, err := log.fp.Write(ent.Encode()); err != nil {
-        return err
-    }
-    
-    // 2. Force the OS to flush the cache to the physical disk hardware
-    return log.fp.Sync() 
-}
+Wire format is still the **9-byte header** from 0103 — this chapter changes **I/O policy**, not layout.
+
+---
+
+## 5. Before / After Visualization
+
+### 0103 (unsafe under power loss)
+
+```text
+Set("user","Morgan")
+  └─ Write(encoded) → page cache ✓
+  └─ return success
+        │
+        └─ ⚡ power loss → entry may never reach disk
+```
+
+### 0104 (durable)
+
+```text
+Set("user","Morgan")
+  └─ Write(encoded) → page cache
+  └─ Sync()         → physical disk ✓
+  └─ return success
+        │
+        └─ ⚡ power loss → entry still on disk after reboot + replay
+```
+
+### Recovery mock
+
+```text
+1. Set user1 → "Morgan"
+2. Set user1 → "Morgan Kim"     (override)
+3. Del user2                    (tombstone if it existed)
+4. Close / crash / reopen
+
+After replay:
+  Get(user1) → "Morgan Kim"
+  Get(user2) → miss
 ```
 
 ---
 
-## ⚠️ Looking Ahead: Atomicity
-While `fsync` guarantees our data survives a power loss, it introduces a new problem. What if the server loses power *while* the physical disk is in the middle of writing our `fsync` command? The file will end up half-written and corrupted. Protecting the database from partially written records (Atomicity) is the next hurdle to overcome.
+## 6. Platform Split
+
+| File | Behavior |
+| :--- | :--- |
+| `os_unix.go` | `createFileSync` + `syncDir` with real `syscall.Fsync` |
+| `os_other.go` | Non-Unix stub: plain `OpenFile`, no directory sync |
+
+Build tags keep Unix durability without breaking Windows builds.
+
+---
+
+## ⚠️ Looking Ahead: Torn Writes
+
+`fsync` guarantees that **whatever made it to disk stays there**. It does **not** guarantee the last write was complete. Power mid-sector can leave a **half-written** final record. Chapter **0105** detects that with CRC32 checksums (Atomicity).
+
+---
+
+## Crucial Takeaways
+
+* `Write()` ≠ durable; `Sync()` / `fsync` is the durability barrier.
+* Unix needs directory fsync on create/rename/delete to avoid orphans.
+* Entry layout unchanged from 0103; the win is I/O policy.
+* Durability without atomicity still risks a corrupt last record → next chapter.

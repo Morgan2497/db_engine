@@ -113,12 +113,11 @@ func (cell *Cell) EncodeKey(toAppend []byte) []byte {
 	switch cell.Type {
 	case TypeI64:
 		// Map signed int64 to unsigned space by flippint the Most Significant Bit 
-		unsigned = uint64(cell.I64) ^ (1 << 63)
+		unsigned := uint64(cell.I64) ^ (1 << 63)
 		return binary.BigEndian.AppendUint64(toAppend, unsigned)
 
 	case TypeStr:
 		return encodeStrKey(toAppend, cell.Str)
-	}
 
 	default:
 		return toAppend
@@ -137,7 +136,7 @@ func (cell *Cell) DecodeKey(data []byte) (rest []byte, err error) {
 		// Read the 8 bytes and reverse the MSB flip.
 		unsigned := binary.BigEndian.Uint64(data[:8])
 		cell.I64 = int64(unsigned ^ (1 << 63))
-		return data[:8], nil
+		return data[8:], nil
 
 	case TypeStr:
 		out, rest, err := decodeStrKey(data)

@@ -41,14 +41,11 @@ func (row Row) EncodeKey(schema *Schema) (key []byte) {
 
 	check(len(row) == len(schema.Cols))
 
-	for idx, value := range row {
-
-		if slices.Contains(schema.PKey, idx) {
-			// Ensure tje cell type matches the shcema definition.
-			check(value.Type == schema.Cols[idx].Type)
-			key = row[idx].EncodeVal(key)
-		}
-
+	for _, idx := range schema.PKey {
+		value := row[idx]
+		// Ensure the cell type matches the shcema definition.
+		check(value.Type == schema.Cols[idx].Type)
+		key = row[idx].EncodeKey(key)
 	}
 	return key
 }
@@ -69,31 +66,32 @@ func (row Row) EncodeVal(schema *Schema) (val []byte) {
 	return val
 }
 
+var ErrOutOfRange = errors.New("out of range")
 func (row Row) DecodeKey(schema *Schema, key []byte) (err error) {
 	// 1. Take the prefix ([ 'l', 'i', 'n', 'k', 0x00]) 4 + 1 = 5
 	//                                           ^^^^
 	prefixLen := len(schema.Table) + 1
 
 	if len(key) < prefixLen {
-		return errors.New("key too short")
+		return ErrOutOfRange
 	}
-
+	
+	if string(key[:len(schema.Table)+1]) != schema.Table+"\x00" {
+		return ErrOutOfRange
+	}
 	// Excluded the table name and only get the keys in bytes.
 	key = key[prefixLen:]
 
 	check(len(row) == len(schema.Cols))
 
-	for idx := range row {
+	for _, idx := range schema.PKey {
 		// the empty cell is currently a black slate. ex: NewRow() ran, it created a Cell that was a black slate: {Type: 0, I64: 0, str: nil}
 		// so need to make sure that what type it is supposed to be before calling decode func in cell.go.
 		row[idx].Type = schema.Cols[idx].Type
+		key, err = row[idx].DecodeKey(key)
 
-		if slices.Contains(schema.PKey, idx) {
-			key, err = row[idx].DecodeVal(key)
-
-			if err != nil {
-				return err
-			}
+		if err != nil {
+			return err
 		}
 	}
 	return nil

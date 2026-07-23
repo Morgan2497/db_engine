@@ -143,3 +143,55 @@ func TestSQLByPKey(t *testing.T) {
 	logSQLResult(t, r)
 	require.Equal(t, 0, len(r.Values))
 }
+
+func TestIterByPKey(t *testing.T) {
+	db := DB{}
+	db.KV.log.FileName = ".test_db"
+	defer os.Remove(db.KV.log.FileName)
+
+	os.Remove(db.KV.log.FileName)
+	err := db.Open()
+	assert.Nil(t, err)
+	defer db.Close()
+
+	schema := &Schema{
+		Table: "t",
+		Cols: []Column{
+			{Name: "k", Type: TypeI64},
+			{Name: "v", Type: TypeI64},
+		},
+		PKey: []int{0},
+	}
+
+	N := int64(10)
+	for i := int64(0); i < N; i += 2 {
+		row := Row{
+			Cell{Type: TypeI64, I64: i},
+			Cell{Type: TypeI64, I64: i},
+		}
+		updated, err := db.Insert(schema, row)
+		require.True(t, updated && err == nil)
+	}
+
+	for i := int64(-1); i < N+1; i++ {
+		row := Row{
+			Cell{Type: TypeI64, I64: i},
+			Cell{},
+		}
+
+		out := []int64{}
+		iter, err := db.Seek(schema, row)
+		for ; err == nil && iter.Valid(); err = iter.Next() {
+			out = append(out, iter.Row()[1].I64)
+		}
+		require.Nil(t, err)
+
+		expected := []int64{}
+		for j := i; j < N; j++ {
+			if j >= 0 && j%2 == 0 {
+				expected = append(expected, j)
+			}
+		}
+		assert.Equal(t, expected, out)
+	}
+}

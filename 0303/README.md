@@ -1,100 +1,133 @@
-### 1. Systems Engineering Overview
-Chapter 0303 bridges the critical gap between lexical tokenization (identifying raw bytes) and Abstract Syntax Tree (AST) construction (enforcing grammatical logic). The engine restricts the `SELECT` execution path to a highly specialized, deterministic pattern: a single-row point query by Primary Key. This intentional limitation guarantees that the parsed `StmtSelect` struct maps directly to a high-speed Key-Value storage lookup at the Storage Layer (0101), completely bypassing complex query planning, full table scans, or relational joins at this stage of the engine's lifecycle.
+# Chapter 0303: SELECT Statement AST (Point Queries)
 
-### 2. Architecture / Core Implementation
-The structural core relies on mapping SQL strings into tightly packed structs. The design explicitly binds parsed values directly into the `Cell` primitives defined in the underlying storage system.
+## Overview: First Real SQL Shape
+0301–0302 can tokenize names and parse literals. This chapter builds the first **statement AST**: a rigid `SELECT` that maps 1:1 onto a primary-key KV lookup.
+
+```text
+SQL string ──parseSelect──► StmtSelect ──(later Exec)──► EncodeKey + Get
+```
+
+**Intentional limit:** exact PK match only. No `OR`, ranges, joins, or aggregates. That keeps the AST a thin wrapper over storage.
+
+---
+
+## 1. AST Types
 
 ```go
-type StmtSelect struct {
-    table string
-    cols  []string
-    keys  []NamedCell
-}
-
 type NamedCell struct {
     column string
-    value  Cell // Binds directly to the disk-ready Cell primitive
+    value  Cell
+}
+
+type StmtSelect struct {
+    table string
+    cols  []string    // projection list
+    keys  []NamedCell // WHERE equalities (PK)
 }
 ```
 
-- Since only a small set of features has been implemented, our SELECT statement supports
-only one fixed form: query a single row by primary key. For example, for a table with
-primary key (c, d), the only supported query is this:
+### Skeleton visualization
 
-```
-select a,b from t where c=1 and d='e';
+```sql
+SELECT a, b FROM t WHERE c=1 AND d='e';
 ```
 
+```text
+StmtSelect
+┌────────┬─────────────────┐
+│ table  │ "t"             │
+│ cols   │ ["a", "b"]      │
+│ keys   │                 │
+│        │  c → Cell(1)    │
+│        │  d → Cell("e")  │
+└────────┴─────────────────┘
 ```
-```
-- Represented as data structures:
 
-``` 
-StmtSelect{
-  table: "t",
-  cols: []string{"a", "b"},
-  keys: []NamedCell{
-    {column: "c", value: Cell{Type: TypeI64, I64: 1}},
-    {column: "d", value: Cell{Type: TypeStr, Str: []byte("e")}},
-  },
+---
+
+## 2. Grammar
+
+```text
+select_stmt    ::= SELECT col_list FROM table WHERE predicate_list ';'
+col_list       ::= name (',' name)*
+predicate      ::= name '=' value
+predicate_list ::= predicate ('AND' predicate)*
+```
+
+```text
+SELECT ──► columns ──► FROM ──► table ──► WHERE ──► eqs ──► ;
+```
+
+---
+
+## 3. Parse Tree Mock
+
+```text
+                    parseSelect
+                         │
+         ┌───────────────┼────────────────┐
+         ▼               ▼                ▼
+     col_list         table           parseWhere
+     a , b              t            c=1 AND d='e'
+                                         │
+                              ┌──────────┴──────────┐
+                              ▼                     ▼
+                         parseEqual            parseEqual
+                         c = 1                 d = 'e'
+```
+
+`parseWhere` is a **flat AND loop**, not a recursive boolean expression tree — perfect for “all these equalities form the PK.”
+
+---
+
+## 4. `parseEqual` Mini-Example
+
+```text
+Input:  foo = 123
+
+NamedCell{
+  column: "foo",
+  value:  Cell{Type: TypeI64, I64: 123},
 }
 ```
 
-The parsing functions act as state-mutating routers:
-* **`parseEqual(out *NamedCell)`**: Combines `tryName`, `tryPunctuation`, and `parseValue`. It enforces strict `ident = literal` formatting.
-* **`parseSelect(out *StmtSelect)`**: The orchestrator. Extracts the target columns, the source table, and delegates the filter logic.
-* **`parseWhere(out *[]NamedCell)` (Derived Implementation)**: The implementation must enforce a strict `ident = literal AND ident = literal` sequence without unbounded recursion:
-
-```go
-func (p *Parser) parseWhere(out *[]NamedCell) error {
-    if !p.tryKeyword("WHERE") {
-        return nil // Optional, or error if PK lookup is strictly enforced
-    }
-    for {
-        var cell NamedCell
-        if err := p.parseEqual(&cell); err != nil {
-            return err
-        }
-        *out = append(*out, cell)
-        
-        if !p.tryKeyword("AND") {
-            break // Exit loop when no more AND tokens exist
-        }
-    }
-    return nil
-}
+```text
+name ── tryPunctuation('=') ── parseValue ──► NamedCell
 ```
 
-### 3. CPU Mechanics & Memory Layout
-While lexical functions like `parseInt` are strictly zero-allocation, this syntactic layer introduces mandatory heap allocations. Slices like `cols []string` and `keys []NamedCell` will trigger heap allocations as they grow via `append`. However, string extraction via `tryName()` still leverages underlying byte slice pointer math to minimize extraneous string building. 
+---
 
-The parser operates as an LL(1) predictive parser. It avoids backtracking; if `tryKeyword` or `tryPunctuation` fails, the memory cursor (`p.pos`) is not advanced. This allows for immediate fallback or error generation without thrashing memory buffers or requiring complex state rewinding.
+## 5. How This Maps to Storage (Mental Model)
 
-### 4. System Constraints & Boundaries
-This parser acts as a rigid, uncompromising funnel. It strictly rejects anything outside the exact format: `SELECT col1, col2 FROM table WHERE pk1 = val1 AND pk2 = val2`. It assumes that the underlying Relational Bridge (0201) is configured to handle composite primary keys exactly in the order they are parsed. There is zero tolerance for `OR` conditions, parentheses, or aggregate functions. The populated `StmtSelect` struct is the absolute boundary between the compiler front-end and the execution back-end.
+```text
+StmtSelect.keys  →  make PK row cells  →  EncodeKey(schema)
+StmtSelect.cols  →  projection after DecodeVal
+StmtSelect.table →  schema lookup / table prefix
+```
 
+```text
+WHERE c=1 AND d='e'
+        │
+        ▼
+KV key ≈  t\0 + Enc(c=1) + Enc(d='e')   (once schema known in 0305)
 ```
-```
-```
-```StmtSelect{
-	table: "t",
-	cols: []string{"a", "b"},
-	keys: []NamedCell{
-		{
-			column: "c",
-			value: Cell{
-				Type: TypeI64,
-				I64:  1,
-				Str:  nil,
-			},
-		},
-		{
-			column: "d",
-			value: Cell{
-				Type: TypeStr,
-				I64:  0,
-				Str:  []byte{'e'}, // The byte representation of 'e'
-			},
-		},
-	},
-}
+
+---
+
+## 6. What Is Explicitly Out of Scope
+
+| Feature | Status |
+| :--- | :--- |
+| `OR`, parentheses | ✗ |
+| `WHERE age > 20` | ✗ (needs ordered indexes later) |
+| `SELECT *` without PK | ✗ (no table scan yet) |
+| INSERT/UPDATE/DELETE | → 0304 |
+
+---
+
+## Crucial Takeaways
+
+* First AST bridges lexer/values to executable structure.
+* SELECT is constrained to **point queries by PK equalities**.
+* `NamedCell` binds a column name to a disk-ready `Cell`.
+* Next: router for **all statement kinds** (0304).

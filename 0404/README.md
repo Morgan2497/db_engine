@@ -16,49 +16,10 @@ This chapter introduces the **Row Iterator**, the core architectural component t
 ## 1. The Multi-Table Co-Location Problem (The Namespace Bug)
 To understand why an advanced iterator wrapper is necessary, we must examine how an embedded database engine stores multiple tables. 
 
-A database engine does not create a separate physical file or independent storage instance for every table. Instead, **all tables share a single, unified KV store namespace**. 
-* The rows for the `users` table, the `orders` table, and the `products` table are interleaved and stored together in sorted order based on their raw byte keys.
-
-### The Danger of Blind Scanning
-If our storage engine executes a range scan for the `users` table starting at ID 100, the physical `KVIterator` will continuously stream raw bytes forward. 
-* Once it exhausts all user records, a naive iterator would keep marching forward into the byte space belonging to the `orders` table. 
-* Without boundary protection, the query engine would silently corrupt the `users` query results with `orders` data, causing catastrophic data leaks across table namespaces.
-
-**The Solution:** We must inject a **Table-Prefix Guard** directly into our decoding logic. Every table's key is prepended with its table name and a null separator (e.g., `schema.Table + "\x00"`). As the iterator scans, it must dynamically inspect incoming byte keys and immediately halt the moment a key steps outside the target table's namespace.
-
-In an embedded database engine, **all tables share a single, unified Key-Value store**. Because primary keys are serialized into raw byte arrays and sorted lexicographically using `bytes.Compare()`, the physical storage layer has no concept of relational tables. It just sees one massive, continuous stream of sorted bytes.
+A database engine does not create a separate physical file or independent storage instance for every table. Instead, **all tables share a single, unified KV store namespace**. Because primary keys are serialized into raw byte arrays and sorted lexicographically using `bytes.Compare()`, the physical storage layer has no concept of relational tables. It just sees one massive, continuous stream of sorted bytes where the rows for different tables are interleaved.
 
 ### Mock Physical Storage View
 Imagine your KV store contains rows for two different tables: `users` and `orders`. Because `u` comes alphabetically before `o`, their raw physical bytes look like this on disk:
-
-```text
-[Key: "users\x00\x00\x00\x00\x00\x00\x00\x01"] -> [Value: Alice]
-[Key: "users\x00\x00\x00\x00\x00\x00\x00\x02"] -> [Value: Bob]
---- (Logical Table Boundary: End of Users, Start of Orders) ---
-[Key: "orders\x00\x00\x00\x00\x00\x00\x00\x01"] -> [Value: Item 99]
-[Key: "orders\x00\x00\x00\x00\x00\x00\x00\x02"] -> [Value: Item 100]
-```
-
-### The Problem Without a Prefix Guard
-If a client executes a range scan on the `users` table, the physical `KVIterator` starts at User 1 and streams forward. Once it outputs User 2, a naive iterator would keep marching forward blindly, reading the next physical key on disk: `"orders\x00..."`. 
-
-Without protection, your database would silently leak `orders` data into your `users` query results.
-
-### The Solution: The Table-Prefix Guard
-To prevent this, every table key is prepended with its table name plus a null terminator (`schema.Table + "\x00"`). When the iterator evaluates an incoming key, it checks:
-
-```go
-if string(key[:len(schema.Table)+1]) != schema.Table+"\x00" {
-    return ErrOutOfRange
-}
-```
-
-If the read-head lands on `"orders\x00..."` while scanning the `users` schema, the prefix check fails immediately, triggering a graceful stop.
-
-To understand why a blind scan causes leaks, let's look at how raw bytes are ordered on disk in a unified Key-Value store.
-
-### The Raw Disk Layout
-Remember that an embedded database stores *all* tables in one single KV store. Because keys are sorted lexicographically by their raw bytes, the `users` table and the `orders` table sit right next to each other:
 
 ```text
 Physical Disk Address | Raw Key Bytes                          | Value
@@ -70,75 +31,63 @@ Disk Block #103       | "orders\x00\x00\x00\x00\x00\x00\x00\x01" | Laptop ($999)
 Disk Block #104       | "orders\x00\x00\x00\x00\x00\x00\x00\x02" | Phone ($699)
 ```
 
-### The Blind Scan Walkthrough
-1. You execute a range query: `SELECT * FROM users WHERE id >= 1`.
-2. The storage engine seeks to `"users\x00...1"` and streams forward.
-3. It reads Block #101 (`users...1`) $\rightarrow$ Valid user (Alice).
-4. It reads Block #102 (`users...2`) $\rightarrow$ Valid user (Bob).
-5. **The Edge:** The iterator finishes Bob and calls `Next()` to grab the next item on disk. The physical cursor moves to Block #103.
-6. Block #103 contains key: `"orders\x00\x00\x00\x00\x00\x00\x00\x01"`.
+### Why a "Blind Scan" is Dangerous (The Analogy)
+To see why blind scanning is a bug, look at how a SQL query actually knows when to finish. When you run a query like:
 
-**Without the Prefix Guard / `ErrOutOfRange` check:** 
-A naive iterator doesn't check the table name prefix. It treats Block #103 as just another user, decodes the laptop order ID as if it were a user ID, and returns a corrupted row to your SQL engine (`users` query accidentally returns order data).
+```sql
+SELECT * FROM users WHERE id >= 1;
+```
 
-**With the Prefix Guard:**
-When the decoder looks at Block #103, it checks: does `"orders\x00..."` start with `"users\x00"`? **No.** 
-It immediately returns `ErrOutOfRange`, the `RowIterator` sets `iter.valid = false`, and the loop safely terminates. Your `users` query stops cleanly right at the boundary line.
+The database SQL engine doesn't magically know how many users exist. Instead, it enters a continuous loop using our iterator:
+
+```go
+for iter.Valid() {
+    row := iter.Row()
+    fmt.Println(row)
+    iter.Next() // moves to the next item on disk
+}
+```
+
+#### The Analogy: Reading a Book Without Chapter Headers
+Imagine Chapter 1 (`users`) and Chapter 2 (`orders`) are printed back-to-back in a massive, unformatted book. You are assigned to read *only* Chapter 1.
+* **Without the Prefix Guard:** You read User 1, User 2... and reach the end of Chapter 1. Your read-head crosses the invisible line and enters Chapter 2 (`orders`). Because you aren't checking for boundaries, you keep reading: *"Order #1: Laptop, Order #2: Phone..."* thinking they are still users. You end up dumping financial orders into a report meant only for user profiles.
+* **With the Prefix Guard:** The moment your read-head touches the first byte of Chapter 2 (`orders\x00...`), the decoder says, *"Wait, this doesn't start with `users\x00`!"* It triggers `ErrOutOfRange`, stops the loop immediately, and your `users` query finishes cleanly without leaking order data.
+
+### The Solution: The Table-Prefix Guard
+To prevent data leaks, every table key is prepended with its table name plus a null terminator (`schema.Table + "\x00"`). As the iterator scans, it dynamically inspects incoming byte keys and immediately halts the moment a key steps outside the target table's namespace.
+
 ---
 
-## 2. The Architectural Solution: `ErrOutOfRange` as Control Flow
+## 2. `ErrOutOfRange` as Control Flow & Length Safety Checks
 To handle boundary violations cleanly without crashing the query engine, we introduce a specialized sentinel error:
 
-    var ErrOutOfRange = errors.New("out of range")
+```go
+var ErrOutOfRange = errors.New("out of range")
+```
 
 When the iterator evaluates a raw key from the underlying storage, it passes it through an updated `DecodeKey()` method:
 
-    func (row Row) DecodeKey(schema *Schema, key []byte) (err error) {
-        if len(key) < len(schema.Table)+1 {
-            return ErrOutOfRange
-        }
-        if string(key[:len(schema.Table)+1]) != schema.Table+"\x00" {
-            return ErrOutOfRange
-        }
-        // ... proceed with standard column decoding
-    }
-
-When we write `len(key) < len(schema.Table) + 1`, we are checking if a raw byte slice fetched from disk is **physically too short to possibly belong to our table**. 
-
-### The Math & The Mock Example
-Let’s trace this using the `users` table:
-*   `schema.Table` = `"users"`
-*   `len(schema.Table)` = 5 (because `'u', 's', 'e', 'r', 's'` takes 5 bytes)
-*   Our prefix format requires the table name **plus** a null byte separator (`\x00`). 
-*   Therefore, the absolute minimum length a valid key for the `users` table can *ever* have is:
-    $$\text{Minimum Length} = 5 \text{ (table name)} + 1 \text{ (null byte)} = 6 \text{ bytes}$$
-
-Now, imagine the physical KV store contains a stray key that is only 3 bytes long (for example, a system key or leftover metadata like `[]byte("abc")`). 
-
-### What happens if you *don't* have this length check?
-Look at the very next line of code in `DecodeKey()`:
 ```go
-if string(key[:len(schema.Table)+1]) != schema.Table+"\x00" {
-    return ErrOutOfRange
+func (row Row) DecodeKey(schema *Schema, key []byte) (err error) {
+    if len(key) < len(schema.Table)+1 {
+        return ErrOutOfRange
+    }
+    if string(key[:len(schema.Table)+1]) != schema.Table+"\x00" {
+        return ErrOutOfRange
+    }
+    // ... proceed with standard column decoding
 }
 ```
-If `key` is `[]byte("abc")` (length 3), and you try to slice it up to index 6 (`key[:6]`), **Go will instantly crash your program** with a fatal runtime panic:
-```text
-panic: runtime error: slice bounds out of range [[:6] with length 3]
-```
 
-### The Two Reasons for this Check:
-1. **Crash Prevention (The Safety Guard):** It stops Go from throwing an out-of-bounds memory panic when trying to slice a key that is shorter than our expected prefix size.
-2. **Logical Fast-Fail:** If a key on disk has a length of 3 bytes, it is mathematically impossible for it to be a `users` table key (which needs at least 6 bytes just for the prefix). Instead of panicking or trying to parse garbage data, it politely returns `ErrOutOfRange` so the iterator knows to skip it.
+### Why `len(key) < len(schema.Table) + 1` is Required
+When we write `len(key) < len(schema.Table) + 1`, we are checking if a raw byte slice fetched from disk is **physically too short to possibly belong to our table**. 
+
+* **The Math & Example:** For the `users` table, `schema.Table` has a length of 5 bytes (`'u', 's', 'e', 'r', 's'`). Adding the null byte separator (`\x00`), the minimum required length is $5 + 1 = 6$ bytes. If a stray system key or metadata key of length 3 bytes appears on disk, it cannot possibly be a valid table key.
+* **Crash Prevention:** Without this check, attempting to slice the key (`key[:len(schema.Table)+1]`) on an undersized key would cause Go to throw a fatal runtime panic (`slice bounds out of range`).
+* **Logical Fast-Fail:** It safely catches invalid key formats and converts them into an `ErrOutOfRange` signal rather than crashing.
 
 ### Why `ErrOutOfRange` is Not a System Failure
-In standard software engineering, an error usually indicates an exceptional failure (such as a disk read failure, null pointer, or network timeout). 
-* In database execution engines, **`ErrOutOfRange` is a vital control-flow primitive.** 
-* It acts as a polite boundary signal. When the decoding layer returns `ErrOutOfRange`, it tells the iterator: *"You have hit the physical end of this table's contiguous storage space. Stop scanning."*
-
-## 2. `ErrOutOfRange` as Control Flow
-
-In standard application development, errors usually represent catastrophic failures (like a database crash, missing file, or network timeout). In a database storage engine, **`ErrOutOfRange` is a communication primitive (control flow)**.
+In standard software engineering, an error usually indicates an exceptional failure (such as a disk read failure, null pointer, or network timeout). In database execution engines, **`ErrOutOfRange` is a vital control-flow primitive.** It acts as a polite boundary signal telling the iterator that it has hit the physical end of the table's contiguous storage space and should stop scanning.
 
 ### Mock Scenario: Hitting the Table Edge
 1. The iterator is scanning the `users` table and processes `[Key: "users\x00...2"]`. Success.
@@ -151,30 +100,57 @@ In standard application development, errors usually represent catastrophic failu
 ## 3. The RowIterator State Machine & Caching Design
 A raw `KVIterator` provides low-level primitive movements (`Next()`, `Seek()`). However, querying a table requires frequent checks to see if the iterator is still valid and requests for the current row's data. 
 
-If every call to `iter.Row()` or `iter.Valid()` had to re-scan or re-decode the underlying byte stream, the database CPU would bottleneck instantly on repetitive parsing overhead.
+### Structural Definition
+To avoid repetitive parsing overhead, the `RowIterator` is designed as a **cached state wrapper**. It stores the decode results directly inside its own memory struct:
 
-### Structuring the `RowIterator`
-To solve this, the `RowIterator` is designed as a **cached state wrapper**. It stores the decode results directly inside its own memory struct:
+```go
+type RowIterator struct {
+    schema *Schema
+    iter   *KVIterator
+    valid  bool // Cached decode result (true if err != ErrOutOfRange)
+    row    Row  // Cached decoded row data
+}
+```
 
-    type RowIterator struct {
-        schema *Schema
-        iter   *KVIterator
-        valid  bool // Cached decode result (true if err != ErrOutOfRange)
-        row    Row  // Cached decoded row data
-    }
+### The $O(1)$ Memory Accessors
+Because the state is cached in the struct, the interface methods exposed to the query planner become trivial, ultra-fast $O(1)$ memory lookups instead of re-parsing bytes from disk on every getter call:
 
-### The Methods: O(1) Memory Accessors
-Because the state is cached in the struct, the interface methods exposed to the query planner become trivial, ultra-fast O(1) memory lookups:
+```go
+// Is iteration finished? (Direct boolean read in RAM)
+func (iter *RowIterator) Valid() bool { 
+    return iter.valid 
+}
 
-    // Is iteration finished?
-    func (iter *RowIterator) Valid() bool { 
-        return iter.valid 
-    }
+// Current row accessor (Direct struct read in RAM)
+func (iter *RowIterator) Row() Row { 
+    return iter.row 
+}
+```
 
-    // Current row accessor
-    func (iter *RowIterator) Row() Row { 
-        return iter.row 
-    }
+### Why Caching Matters: Evaluating a Row Within a Single Query
+When you write a SQL query, it rarely just fetches raw data and hands it to you. It passes through multiple internal processing steps called **query operators**. Consider this single query:
+
+```sql
+SELECT name, age 
+FROM users 
+WHERE age > 20 AND status = 'active' 
+ORDER BY name;
+```
+
+When the database engine processes a single row (for example, **User #2: Bob, Age 25, Status 'active', Email 'bob@email.com', Address '123 Main St'**), that row has to pass through several internal checks:
+1. **The Filter Operator (`age > 20`):** Inspects Bob's age field.
+2. **The Second Filter Operator (`status = 'active'`):** Inspects Bob's status field.
+3. **The Projection Operator (`SELECT name, age`):** Strips away his email and address fields, keeping only name and age.
+4. **The Sorting Operator (`ORDER BY name`):** Inspects Bob's name to see where he fits in the final sorted output array.
+
+If the iterator did *not* cache the decoded row in memory, every single one of those internal operators would have to re-read Bob's raw bytes from disk and re-run all the binary decoding math from scratch just to evaluate him. Caching ensures Bob is decoded **once**, and all operators share that clean Go struct instantly.
+
+### Where the $O(1)$ Memory Fetch Shines (Scanning 100,000 Rows)
+This speed advantage shines microsecond by microsecond while scanning a dataset inside a single query. Think about what happens when a query scans **100,000 rows**:
+* **The Slow Way (Without Caching):** Every time the engine moves to a new row (`Next()`), it does raw I/O and heavy byte-decoding. Worse, if an operator asks for the row data multiple times, it triggers decoding all over again. Across 100,000 rows, that turns into millions of redundant CPU cycles spent parsing binary data.
+* **The Fast Way (With Caching / $O(1)$ Accessors):** 
+  1. `iter.Next()` runs once: It moves the physical disk pointer and does the heavy decoding math one time, storing the resulting struct in `iter.row`.
+  2. The SQL engine loops through its operators, calling `iter.Row()` over and over. Because `iter.row` is already a native Go struct sitting right there in RAM, fetching it takes zero disk I/O and zero math. It is an instantaneous $O(1)$ memory pointer lookup.
 
 ---
 
@@ -182,60 +158,18 @@ Because the state is cached in the struct, the interface methods exposed to the 
 
 When the query engine wants to advance to the next record, it calls `iter.Next()`. This method orchestrates the physical-to-relational translation pipeline in a strict, sequential order:
 
-    func (iter *RowIterator) Next() (err error) {
-        // Step 1: Advance the raw storage pointer in the underlying KV engine
-        if err = iter.iter.Next(); err != nil {
-            return err
-        }
-        
-        // Step 2: Decode the raw bytes and check table boundary limits
-        iter.valid, err = decodeKVIter(iter.schema, iter.iter, iter.row)
+```go
+func (iter *RowIterator) Next() (err error) {
+    // Step 1: Advance the raw storage pointer in the underlying KV engine
+    if err = iter.iter.Next(); err != nil {
         return err
     }
-
-When building database iterators, developers often make the mistake of performing computations inside getter methods (e.g., parsing raw bytes every time `Row()` is called). This creates massive CPU bottlenecks.
-
-### The Anti-Pattern (On-Demand Parsing - Slow)
-If `Row()` looked like this:
-```go
-// BAD: Re-decodes bytes from disk on every single call
-func (iter *RowIterator) Row() Row {
-    return decodeBytesIntoRow(iter.iter.Value()) 
+    
+    // Step 2: Decode the raw bytes and check table boundary limits
+    iter.valid, err = decodeKVIter(iter.schema, iter.iter, iter.row)
+    return err
 }
 ```
-If your SQL execution engine evaluates a row 50 times across different filters and projections, it would re-parse the raw byte slice 50 times, wasting precious CPU cycles on repetitive binary math.
-
-### The Cached Architecture ($O(1)$ Lookups - Fast)
-Instead, our `RowIterator` uses a **cached state wrapper**. It does the heavy decoding work **once** inside `Next()`, stores the resulting Go struct directly in its own memory struct, and serves subsequent requests instantly.
-
-#### Mock Memory State During Iteration
-When `iter.Next()` runs successfully, the struct holds this exact state in RAM:
-
-```go
-// State in RAM after a successful Next() call
-iter := &RowIterator{
-    schema: &Schema{Table: "users"},
-    iter:   <pointer to underlying KVIterator at disk position 2>,
-    valid:  true,
-    row:    Row{Fields: []Value{{Type: TypeI64, I64: 2}, {Type: TypeString, Str: "Bob"}}},
-}
-```
-
-When the SQL query engine calls `iter.Valid()` or `iter.Row()`, there is **no disk I/O, no byte scanning, and no decoding math**. It is a direct, instantaneous $O(1)$ memory fetch:
-
-```go
-// Is iteration finished? (Direct boolean read in RAM)
-func (iter *RowIterator) Valid() bool { 
-    return iter.valid // returns true
-}
-
-// Current row accessor (Direct struct read in RAM)
-func (iter *RowIterator) Row() Row { 
-    return iter.row // returns Row{Fields: ...}
-}
-```
-
-This caching strategy ensures that the storage layer's physical byte-streaming is cleanly decoupled from the relational layer's memory models, maximizing throughput during high-speed range scans.
 
 ### The Step-by-Step Lifecycle Trace
 1. **The Movement:** `iter.iter.Next()` moves the raw hardware or memory cursor forward to the next physical KV pair in the sorted index.

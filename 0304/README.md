@@ -1,80 +1,161 @@
-# Chapter 0304: Statements
+# Chapter 0304: Statements — Multi-Statement Router
 
-## Systems Engineering Overview
-The transition in this chapter elevates the engine from a single-statement processor (handling only `SELECT`) into a multi-statement relational database router. To achieve this, the author implements a centralized dispatch mechanism using a classic LL(k) recursive descent parsing strategy. 
+## Overview: One Doorway for Every SQL Verb
+0303 could parse only `SELECT`. A real engine needs DDL and DML too. This chapter adds a **recursive-descent dispatcher** `parseStmt()` that peeks at keywords and builds the right AST node.
 
-By upgrading the tokenizer to look ahead just one or two tokens, the parser can definitively classify incoming Data Definition Language (DDL) and Data Manipulation Language (DML) commands without relying on heavy compiler-construction theories or abstract grammar tools. This keeps the parsing layer tightly coupled, lightweight, and perfectly suited to the engine's current constraints.
-
-## Architecture
-The architectural delta introduces a root statement router and the memory structures required to represent the parsed SQL commands as Abstract Syntax Tree (AST) nodes.
-
-**1. AST Node Structures (The Schemas)**
-Once the statement type is identified, the parser populates a specific struct to hold the extracted tokens. These types map directly to the required KV storage operations:
-
-```go
-type StmtCreatTable struct {
-	table string
-	cols  []Column
-	pkey  []string
-}
-
-type StmtInsert struct {
-	table string
-	value []Cell
-}
-
-type StmtUpdate struct {
-	table string
-	keys  []NamedCell
-	value []NamedCell
-}
-
-type StmtDelete struct {
-	table string
-	keys  []NamedCell
-}
+```text
+                    parseStmt()
+                         │
+     ┌──────────┬────────┼────────┬──────────┐
+     ▼          ▼        ▼        ▼          ▼
+  SELECT     CREATE   INSERT   UPDATE     DELETE
+  StmtSelect StmtCreate… StmtInsert StmtUpdate StmtDelete
 ```
 
-**2. The Dispatcher (`parseStmt`)**
-This function is the new entry point for execution. It utilizes an upgraded `tryKeyword` function that accepts variadic arguments (`kws ...string`), allowing the parser to consume multi-word SQL commands (like `CREATE TABLE`) as a single logical branch condition.
+Return type is `interface{}` (polymorphic AST). Chapter 0305 will `type switch` on it.
 
-```go
-func (p *Parser) parseStmt() (out interface{}, err error) {
-	if p.tryKeyword("SELECT") {
-		stmt := &StmtSelect{}
-		err = p.parseSelect(stmt)
-		out = stmt
-	} else if p.tryKeyword("CREATE", "TABLE") {
-		stmt := &StmtCreatTable{}
-		err = p.parseCreateTable(stmt)
-		out = stmt
-	} else if p.tryKeyword("INSERT", "INTO") {
-		stmt := &StmtInsert{}
-		err = p.parseInsert(stmt)
-		out = stmt
-	} else if p.tryKeyword("UPDATE") {
-		stmt := &StmtUpdate{}
-		err = p.parseUpdate(stmt)
-		out = stmt
-	} else if p.tryKeyword("DELETE", "FROM") {
-		stmt := &StmtDelete{}
-		err = p.parseDelete(stmt)
-		out = stmt
-	} else {
-		err = errors.New("unknown statement")
-	}
-	
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
+---
+
+## 1. AST Zoo (Skeleton Cards)
+
+### CREATE TABLE
+
+```sql
+create table t (a string, b int64, primary key (b));
 ```
 
-## CPU/Memory Layout
-* **Polymorphic Heap Escapes:** `parseStmt()` returns an `interface{}`. In Go, an empty interface is represented in memory as a two-word structure: one pointer to the type descriptor (e.g., `*StmtInsert`) and one pointer to the actual data. Returning pointers to structs (like `&StmtInsert{}`) through an interface forces these AST nodes to escape the stack and allocate on the heap. This is an acceptable memory trade-off for a unified parsing pipeline.
-* **Dynamic Slices:** The AST structs heavily utilize Go slices (`[]Column`, `[]string`, `[]Cell`, `[]NamedCell`). Because the arity of the incoming SQL queries (e.g., number of columns in an insert) is unknown at compile time, these slices will dynamically allocate and potentially reallocate backing arrays on the heap as the parser loops through the tokens.
+```text
+StmtCreateTable
+┌────────┬────────────────────────────────┐
+│ table  │ "t"                            │
+│ cols   │ [{a,TypeStr}, {b,TypeI64}]     │
+│ pkey   │ ["b"]                          │
+└────────┴────────────────────────────────┘
+```
 
-## System Constraints
-* **Single-Row Point Lookups:** The engine's mutation capabilities are strictly constrained. The `WHERE` clause logic currently maps directly to the `keys []NamedCell` slice in the update and delete structs. This rigidly limits updates and deletes to single-row operations using exact Primary Key matches.
-* **No Range Scans or Indexing:** Because we are forcing point-lookups on the primary key, complex predicates (e.g., `>`, `<`, `!=`), secondary index lookups, and range queries are completely unsupported at this layer.
+### INSERT
+
+```sql
+insert into t values (1, 'hi');
+```
+
+```text
+StmtInsert
+┌────────┬──────────────────────────────┐
+│ table  │ "t"                          │
+│ value  │ [Cell(1), Cell("hi")]        │
+└────────┴──────────────────────────────┘
+```
+
+### UPDATE
+
+```sql
+update t set a=1, b=2 where c=3 and d=4;
+```
+
+```text
+StmtUpdate
+┌────────┬────────────────────────────────┐
+│ table  │ "t"                            │
+│ value  │ SET assignments (NamedCells)   │
+│ keys   │ WHERE equalities (NamedCells)  │
+└────────┴────────────────────────────────┘
+```
+
+### DELETE
+
+```sql
+delete from t where c=3 and d=4;
+```
+
+```text
+StmtDelete{ table:"t", keys:[ c→3, d→4 ] }
+```
+
+---
+
+## 2. Grammar Summary
+
+```text
+stmt ::= select | create | insert | update | delete
+
+create ::= CREATE TABLE name '(' item (',' item)* ')' ';'
+item   ::= name type | PRIMARY KEY '(' name (',' name)* ')'
+type   ::= int64 | string
+
+insert ::= INSERT INTO name VALUES '(' value (',' value)* ')' ';'
+update ::= UPDATE name SET assign (',' assign)* WHERE preds ';'
+delete ::= DELETE FROM name WHERE preds ';'
+select ::= SELECT cols FROM name WHERE preds ';'
+```
+
+---
+
+## 3. Variadic Keywords + Rollback
+
+Multi-word keywords need lookahead with undo:
+
+```text
+tryKeyword("CREATE", "TABLE")
+  saved = pos
+  match CREATE? ──no──► rollback, return false
+  match TABLE?  ──no──► rollback, return false
+  success: pos advanced past both
+```
+
+```text
+Input: "CREATE VIEW ..."
+  CREATE ✓  TABLE ✗  → rollback → try next statement kind
+```
+
+---
+
+## 4. Comma-List Combinator
+
+Parenthesized lists share one pattern:
+
+```text
+'('  item  (',' item)*  ')'
+
+Used for:
+  CREATE TABLE ( ... )
+  PRIMARY KEY ( ... )
+  INSERT VALUES ( ... )
+```
+
+```text
+( a string , b int64 , primary key (b) )
+  └─item─┘   └─item─┘   └─────item─────┘
+```
+
+---
+
+## 5. Dispatcher Decision Table
+
+| Leading keywords | AST |
+| :--- | :--- |
+| `SELECT` | `*StmtSelect` |
+| `CREATE TABLE` | `*StmtCreateTable` |
+| `INSERT INTO` | `*StmtInsert` |
+| `UPDATE` | `*StmtUpdate` |
+| `DELETE FROM` | `*StmtDelete` |
+| else | error |
+
+---
+
+## 6. Constraints (Still Point-Query World)
+
+| Allowed | Not yet |
+| :--- | :--- |
+| Single-row PK WHERE | Range scans |
+| Exact equality AND-chains | OR / expressions |
+| Typed cols `int64`/`string` | More SQL types |
+
+---
+
+## Crucial Takeaways
+
+* `parseStmt` is the LL(k) front door for all SQL verbs.
+* Each statement becomes a small, typed AST card.
+* Variadic `tryKeyword` + rollback enables multi-word phrases.
+* Next: **execute** those cards against schemas + KV (0305).
