@@ -1,84 +1,177 @@
 # Chapter 0105: Atomicity and Checksums
 
-## Overview: The Illusion of Safe Writes
-In the previous chapter, we implemented `fsync` to bypass the OS Page Cache and force data directly to physical disk platters. While this guarantees durability (the "D" in ACID), it introduces a new vulnerability: **Incomplete or Torn Writes**. 
+## Overview: The Last Record Can Still Lie
+Chapter 0104 forced log bytes through `fsync` onto physical media. Durability (“D”) is covered. A new failure mode remains: **torn writes**.
 
-File writes are not inherently atomic. If power is lost mid-write, the disk does not guarantee the entire payload is saved. This chapter implements **Atomicity** (the "A" in ACID) at the storage layer using mathematical checksums to detect and discard corrupted state.
+If power dies *while* the disk is writing a multi-byte record, that **last** entry may be incomplete, zero-filled, or truncated. Blindly replaying it can poison `kv.mem` with garbage sizes and corrupt values.
 
----
+```text
+Valid history                          Torn tip
+┌────────┬────────┬────────┐          ┌─────┐
+│ rec 1  │ rec 2  │ rec 3  │   +      │ ??? │  ← half-written
+└────────┴────────┴────────┘          └─────┘
+     ▲                                    ▲
+     └── safe after fsync                 └── must DETECT and IGNORE
+```
 
-## The Core Problem: Torn Writes
-When appending a large record (e.g., 1000 bytes) to our log file, a sudden power failure or kernel panic can result in three distinct failure states:
-
-* **Partial Data:** The file size increases by the full 1000 bytes, but only a fraction of the data makes it to the physical sectors.
-* **Garbage Data:** The file size increases by 1000 bytes, but no actual payload is written. The OS leaves previously deleted garbage bytes (or zeros) in that allocated space.
-* **Truncated Write:** The file size only increases by a fraction (e.g., 500 bytes), cleanly cutting off the payload.
-
-In all scenarios, the previously `fsynced` records remain pristine. Only the *last* record being actively written is corrupted. If our recovery loop blindly trusts the file size or the entry header, it will read this corrupted or garbage data into our RAM map, destroying the integrity of the database.
-
-### Hardware-Level Atomicity vs. Software Atomicity
-The CPU handles atomic memory operations for concurrency control. Disks, however, operate in **Sectors** (historically 512 Bytes, modern drives use 4 Kilobytes). Writing a single sector to a physical disk is generally considered atomic by the hardware controller. 
-
-Many legacy software systems achieve atomicity by reserving the first sector of a file to store a pointer to the last known good entry. This requires writing the data, calling `fsync`, updating the pointer sector, and calling `fsync` again. We can achieve software-level atomicity without the heavy performance penalty of double-fsyncing by utilizing **Checksums**.
+This chapter adds **Atomicity** (“A”) at the record level: only **complete, checksum-verified** entries are replayed.
 
 ---
 
-## The Implementation: CRC32 Verification
-We are expanding our binary header from 9 bytes to 13 bytes to prepend a 4-byte checksum. By calculating a mathematical hash of our exact payload before writing it, we can verify that exact payload upon reading it.
+## 1. Three Torn-Write Failure Modes
 
-### The New Binary Layout
-The physical layout of our log entries on disk is now:
+Assume we intended to append a 1000-byte record:
 
-| Field | Size (Bytes) | Description |
+| Mode | File size | Payload on disk | Danger |
+| :--- | :--- | :--- | :--- |
+| Partial data | +1000 | Only some bytes correct | Wrong payload, maybe OK-looking sizes |
+| Garbage / zeros | +1000 | Old garbage or `0x00` | Fake lengths → huge seeks |
+| Truncated | +500 | Cut mid-record | Incomplete header/payload |
+
+Previously fsynced records stay fine. Only the **active last write** is unsafe.
+
+---
+
+## 2. Hardware vs Software Atomicity
+
+Disks write in **sectors** (512 B historically, often 4 KiB now). One sector write is roughly atomic in hardware. Multi-sector records are not.
+
+| Strategy | Cost | Approach |
 | :--- | :--- | :--- |
-| `crc32` | 4 | Mathematical hash of the Key + Value data |
-| `key_size` | 4 | Unsigned integer representing key length |
-| `val_size` | 4 | Unsigned integer representing value length |
-| `deleted` | 1 | Boolean tombstone flag (1 for true, 0 for false) |
-| `key_data` | Variable | The raw byte slice of the key |
-| `val_data` | Variable | The raw byte slice of the value |
+| Double-fsync pointer sector | Slow (2× fsync) | Write data, fsync, update “last good” pointer, fsync again |
+| **Checksum per record** | Fast | Write record with CRC; on read, verify or stop |
+
+We choose **CRC32** — detect corruption without a second fsync barrier per entry.
 
 ---
 
-## Checksum Strategy: CRC32 vs. Cryptographic Hashes
-Checksums are our defense against both torn writes and silent hardware corruption (e.g., bit-rot or flipped bits in physical memory/disk). However, choosing the *right* hash function is crucial for high-throughput database performance.
+## 3. New Wire Format: 13-Byte Header
 
-We explicitly avoid cryptographic hashes like SHA-256 or MD5. Cryptographic hashes are designed for security and collision resistance, making them computationally heavy and detrimental to write throughput. We only need to detect hardware failure or torn writes, making CRC32 (Cyclic Redundancy Check) vastly faster and smaller (4 bytes).
+```text
+┌────────┬──────────┬──────────┬─────────┬──────────┬──────────┐
+│ crc32  │ key size │ val size │ deleted │ key data │ val data │
+│ 4 B    │ 4 B      │ 4 B      │ 1 B     │   N B    │   M B    │
+└────────┴──────────┴──────────┴─────────┴──────────┴──────────┘
+Offset: 0        4          8         12        13
+```
 
-**The Null-Byte Poisoning Problem:**
-Why use `crc32` instead of a simple 16-bit integer sum (like the one used in TCP/IP headers)? If the OS allocates space on the disk but fails to write the data, the disk sectors might be filled with zero-bytes (`\x00`). If you sum up a million zero-bytes, the result is still `0`. A simple sum cannot differentiate between "valid data that happens to sum to zero" and "empty garbage." CRC32 algorithms are designed to produce a non-zero hash even for null-byte payloads, easily catching empty-sector corruption.
+| Offset | Size | Field |
+| :---: | :---: | :--- |
+| 0 | 4 | `crc32` — CRC32-IEEE of bytes from offset 4 to end of record |
+| 4 | 4 | `key_size` (uint32 LE) |
+| 8 | 4 | `val_size` (uint32 LE; 0 for tombstones) |
+| 12 | 1 | `deleted` |
+| 13 | N | key |
+| 13+N | M | value |
 
----
+### Skeleton: `key="k1"`, `val="xxx"`, not deleted
 
-## Execution and Error Handling 
-During the `KV.Open()` crash recovery loop, we must meticulously handle how bytes are read from the disk into our engine. 
+```text
+CRC covers: [key_size|val_size|deleted|key|val]
+            everything AFTER the crc field itself
 
-### The Trap of `io.Reader` and the Power of `io.ReadFull()`
-When working with low-level file I/O, developers often mistakenly assume that asking the OS for a specific number of bytes will always return exactly that number of bytes—or an End-Of-File (EOF) error. This is false. 
-
-The standard `io.Reader` interface is legally allowed to return fewer bytes than the requested buffer length. Kernel-level I/O scheduling, system interrupts, or pipe buffers can cause a read to return prematurely. Because our engine is built to operate across OS boundaries (developing on a Linux system but producing executables for Windows environments), we cannot rely on OS-specific file reading quirks. We must force the system to give us exactly what we asked for.
-
-Instead of writing a manual `for` loop to keep reading until our buffer is full, we leverage Go's standard library: `io.ReadFull(r Reader, buf []byte)`.
-
-`io.ReadFull()` guarantees the buffer is completely filled. If it hits an EOF *before* the buffer is full, it returns a highly specific error: `io.ErrUnexpectedEOF`. For our engine, this error is a perfect, deterministic flag that we just encountered a truncated, torn write.
-
----
-
-## Handling Incomplete Log Records (The Recovery Loop)
-During engine startup, our `KV.Open()` function replays the log from top to bottom. When `Entry.Decode()` returns either `io.ErrUnexpectedEOF` or our custom `ErrBadSum` (checksum mismatch), it flags `eof=true`.
-
-**The critical rule of recovery:** We do not crash. We gracefully ignore the final, corrupted record and halt the read loop.
-
-**Why only the *last* record?**
-We cannot skip ahead because our engine's architecture relies on the binary header to tell us the size of the record (`KeySize` and `ValSize`). If a write was torn or corrupted by garbage data, the size headers themselves are completely untrustworthy. A corrupted 4-byte size header might incorrectly tell the engine to jump ahead 2.5 Gigabytes to find the next record. 
-
-Therefore, any corruption is treated as a fatal break in the log's chain. Once the chain is broken, the log is effectively over.
+Layout:
+[ C0 C1 C2 C3 | 2 0 0 0 | 3 0 0 0 | 0 | k 1 | x x x ]
+  └─ crc32 ─┘   key=2     val=3     △
+                                    deleted
+```
 
 ---
 
-## Summary: The Foundation of ACID
-By combining **Append-Only Logs**, **OS-level `fsync`**, and **CRC32 Checksums**, we have built a storage engine that can survive sudden power loss and guarantee that previously successful writes are never lost or corrupted. 
+## 4. Why CRC32 (Not SHA-256, Not a Simple Sum)?
 
-This specific combination is the absolute core of robust, embedded data storage. It is the exact reason why engines like SQLite are the gold standard for local, non-cloud applications. Basic file operations simply cannot guarantee Durability (saving to physical metal) and Atomicity (all-or-nothing writes).
+| Hash | Why / why not |
+| :--- | :--- |
+| SHA-256 / MD5 | Cryptographic strength we don’t need; too slow for every write |
+| Simple byte sum | **Null-byte poisoning:** a torn sector of zeros sums to `0` — indistinguishable from “valid empty” |
+| **CRC32** | Fast, 4 bytes, designed to catch burst/bit errors; zeros don’t “look valid” by accident |
 
-As we continue to build out this engine, remember that this log is only the persistence layer. When we eventually introduce complex in-memory data structures (like B-Trees for indexing), we will need to re-verify our Atomicity and Durability guarantees to ensure they hold up under concurrency.
+```text
+Torn zeros:  00 00 00 00 00 ...
+Simple sum:  0  → might look "OK"
+CRC32:       non-trivial → ErrBadSum → stop replay
+```
+
+---
+
+## 5. `io.ReadFull` and Unexpected EOF
+
+`io.Reader.Read` may return fewer bytes than requested. For fixed headers that is fatal.
+
+| Error from `ReadFull` | Meaning for us |
+| :--- | :--- |
+| `nil` | Got exact buffer length |
+| `io.EOF` | Clean end of file (no more records) |
+| `io.ErrUnexpectedEOF` | Hit EOF **mid-record** → torn/truncated write |
+| `ErrBadSum` | Bytes present but CRC mismatch → corrupt tip |
+
+Recovery rule in `Log.Read`:
+
+```text
+Decode returns EOF | UnexpectedEOF | ErrBadSum
+        │
+        ▼
+  treat as end-of-log (eof=true)
+  DO NOT crash; DO NOT skip ahead
+```
+
+**Why not skip ahead?** Size fields inside a torn header are untrustworthy. A garbage `val_size` might say “jump 2.5 GB.” Corruption breaks the chain — the log ends here.
+
+---
+
+## 6. Recovery Mock Visualization
+
+```text
+Disk after crash:
+
+┌──────────────┬──────────────┬─────────────┐
+│ good entry A │ good entry B │ GARBAGE tip │
+│ CRC ✓        │ CRC ✓        │ CRC ✗ / short│
+└──────────────┴──────────────┴─────────────┘
+
+Replay:
+  apply A → mem updated
+  apply B → mem updated
+  tip fails CRC / UnexpectedEOF → STOP
+Final mem: state as of B  (A and B durable; tip discarded)
+```
+
+Test-shaped example:
+
+```text
+1. Write key1 → value1 (valid, fsynced)
+2. Append raw garbage {0xDE,0xAD,0xBE,0xEF,0x00} without care
+3. Reopen DB
+4. Get("key1") still "value1"   ← garbage tip ignored
+```
+
+---
+
+## 7. ACID Foundation So Far
+
+```text
+0103  Append-only log     → history & recovery path
+0104  fsync               → Durability (D)
+0105  CRC32 + ReadFull    → Atomicity (A) per record
+```
+
+```text
+┌─────────────────────────────────────────────┐
+│  Storage engine survival kit                │
+│  • Never overwrite in place                 │
+│  • Sync before claiming success             │
+│  • Verify every record before trusting it   │
+└─────────────────────────────────────────────┘
+```
+
+This is the same philosophical core behind embedded engines like SQLite’s careful write path: plain file I/O is not a database.
+
+---
+
+## Crucial Takeaways
+
+* Torn last records are normal under power loss; detection is mandatory.
+* CRC lives in a 4-byte prefix; it covers the rest of the record.
+* `ReadFull` + `ErrUnexpectedEOF` catch truncated tips.
+* On bad sum / unexpected EOF: **end replay**, keep prior good state.
+* Next leap: leave raw bytes and build **typed relational cells** (0201).

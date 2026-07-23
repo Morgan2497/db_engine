@@ -43,10 +43,9 @@ func (row Row) EncodeKey(schema *Schema) (key []byte) {
 
 	for idx, value := range row {
 
-		// Ensure tje cell type matches the shcema definition.
-		check(value.Type == schema.Cols[idx].Type)
-
 		if slices.Contains(schema.PKey, idx) {
+			// Ensure tje cell type matches the shcema definition.
+			check(value.Type == schema.Cols[idx].Type)
 			key = row[idx].Encode(key)
 		}
 
@@ -60,12 +59,10 @@ func (row Row) EncodeVal(schema *Schema) (val []byte) {
 	check(len(row) == len(schema.Cols))
 
 	// 2. Iterate sequantially to guarantee strict column ordering.
-	for idx := range row {
-		value := row[idx]
-		check(value.Type == schema.Cols[idx].Type)
-
+	for idx, value := range row {
 		// 3. If not pk, then proceed.
 		if !slices.Contains(schema.PKey, idx) {
+			check(value.Type == schema.Cols[idx].Type)
 			val = row[idx].Encode(val)
 		}
 	}

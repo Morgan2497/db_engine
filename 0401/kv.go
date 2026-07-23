@@ -163,12 +163,12 @@ func (kv *KV) Del(key []byte) (deleted bool, err error) {
 	if !exist {
 		return false, nil
 	}
-	if deleted {
-		// Write tombstone to disk FIRST
-		if err = kv.log.Write(&Entry{key: key, deleted: true}); err != nil {
-			return false, err
-		}
-		delete(kv.mem, string(key))
+
+	// Write tombstone to disk FIRST
+	if err = kv.log.Write(&Entry{key: key, deleted: true}); err != nil {
+		return false, err
 	}
-	return
+	kv.keys = slices.Delete(kv.keys, idx, idx+1)
+	kv.vals = slices.Delete(kv.vals, idx, idx+1)
+	return true, nil
 }
