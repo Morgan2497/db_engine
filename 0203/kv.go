@@ -48,20 +48,20 @@ const (
 	ModeUpdate UpdateMode = 2 // update existing.
 )
 
-func (kv *KV) SetEx(key []byte, val []byte, mode UpdateMode) (bool, error) {
+func (kv *KV) SetEx(key []byte, val []byte, mode UpdateMode) (updated bool, err error) {
 	// 1. Look up the current state.
 	prev, exist := kv.mem[string(key)]
-	
+
 	// 2. Eval. the write intent.
 	switch mode {
-		case ModeUpsert:
-			updated := !exist || !bytes.Equal(prev, val)
-		case ModeInsert:
-			updated := !exist
-		case ModeUpdate:
-			updated := exist && !bytes.Equal(prev, val)
-		default:
-			panic("unreachable")
+	case ModeUpsert:
+		updated = !exist || !bytes.Equal(prev, val)
+	case ModeInsert:
+		updated = !exist
+	case ModeUpdate:
+		updated = exist && !bytes.Equal(prev, val)
+	default:
+		panic("unreachable")
 	}
 
 	// 3. Apply the mutation if the eval. passed.
@@ -71,11 +71,11 @@ func (kv *KV) SetEx(key []byte, val []byte, mode UpdateMode) (bool, error) {
 		}
 		kv.mem[string(key)] = val
 	}
-	return updated, nil
+	return
 }
 
 func (kv *KV) Set(key []byte, val []byte) (updated bool, err error) {
-	return kv.SetEx(key, val, ModeUpate)	
+	return kv.SetEx(key, val, ModeUpsert)
 }
 
 func (kv *KV) Del(key []byte) (deleted bool, err error) {
