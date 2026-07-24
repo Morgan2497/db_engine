@@ -1,4 +1,5 @@
- package kv 
+package kv
+
 // Parser represents our zero-allocation string cursor.
 type Parser struct {
 	buf string
@@ -10,33 +11,27 @@ func NewParser(s string) Parser {
 	return Parser{buf: s, pos: 0}
 }
 
-/* 
+/*
 	1. Skip leading spaces.
 	2. First char is a letter or _, following chars are letters, digits, or _.
 	3. On success, return true and advance pos.
 	4. On failure, return false and keep pos.
 */
 // Parse table, column names.
-
 func (p *Parser) tryName() (string, bool) {
-	// 1. Get the pos.
 	oldPos := p.pos
-	
-	// 0  1  2  3  4 
-	//    u  s  e  r
-	// 2. Iterate until there is a space.
+
 	for p.pos < len(p.buf) && isSpace(p.buf[p.pos]) {
 		p.pos++
 	}
-	
-	// 3. First character validation.
-	if p.pos >= len(buf) || !isNameStart(p.buf[p.pos]) {
-		p.pos = oldPos 
+
+	if p.pos >= len(p.buf) || !isNameStart(p.buf[p.pos]) {
+		p.pos = oldPos
 		return "", false
 	}
 
-	start := p.pos 
-	p.pos++ 
+	start := p.pos
+	p.pos++
 
 	for p.pos < len(p.buf) && isNameContinue(p.buf[p.pos]) {
 		p.pos++
@@ -44,6 +39,7 @@ func (p *Parser) tryName() (string, bool) {
 
 	return p.buf[start:p.pos], true
 }
+
 // isSpace detects standard whitespace characters.
 func isSpace(ch byte) bool {
 	switch ch {
@@ -77,4 +73,3 @@ func isNameContinue(ch byte) bool {
 func isSeparator(ch byte) bool {
 	return ch < 128 && !isNameContinue(ch)
 }
-
