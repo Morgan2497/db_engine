@@ -1,5 +1,7 @@
 # Chapter 0101: In-Memory Key-Value Store
 
+> **Course map:** Start here for the full bottom-up path. See the [repo README](../README.md) for chapter responsibilities, operation call chains, and study order.
+
 ## Overview: The Basement of the Database
 Before SQL, schemas, logs, or disks, every database engine needs a **storage kernel**: a place that can store a key and return its value. This chapter builds the smallest possible version of that kernel — an in-memory map of raw bytes.
 

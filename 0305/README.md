@@ -1,5 +1,7 @@
 # Chapter 0305: Execute SQL — Closing the Loop
 
+> **Course map:** End-to-end SQL milestone (`TestSQLByPKey`). Ordering and scans continue in 04xx. See [repo README](../README.md).
+
 ## Overview: Parser Meets Storage
 0304 produces AST nodes. This chapter builds the **execution engine**: route each AST to a pipeline, validate against a schema, talk to `KV`, and always return a unified **`SQLResult`**.
 

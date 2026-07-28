@@ -1,5 +1,7 @@
 # Chapter 0204: CRUD — The Relational `DB` Wrapper
 
+> **Course map:** Relational layer milestone — `Insert` / `Select` / `Update` / `Delete`. SQL arrives in 0305. See [repo README](../README.md).
+
 ## Overview: Stop Hand-Encoding Rows
 0202 taught `EncodeKey`/`EncodeVal`. 0203 taught conditional `SetEx`. Application code still shouldn’t juggle those by hand.
 
