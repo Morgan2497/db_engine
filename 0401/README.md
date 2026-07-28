@@ -1,5 +1,7 @@
 # 0401: Sorting and Search
 
+> **Course map:** Storage goes ordered (`keys[]` / `vals[]`); SQL and `DB` API stay the same. See [repo README](../README.md) for how 04xx fits after 0305.
+
 ## 1. Architectural Transition: Beyond Point Lookups
 
 A primitive Key-Value (KV) engine built on top of an unordered Hash Map handles point lookups ($O(1)$ operations like `GET`, `SET`, and `DEL`) with high efficiency. However, hash tables lack structural order, making them incapable of supporting fundamental relational database capabilities. 
