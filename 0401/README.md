@@ -261,6 +261,161 @@ SetEx("post:25", val, ModeUpsert) when key is new:
 
 `SetEx` mode semantics (`ModeInsert` / `ModeUpdate` / `ModeUpsert`) are **unchanged** from 0203.
 
+### Concrete Example: `link` table (same data, different RAM layout)
+
+Three rows inserted via SQL:
+
+```sql
+CREATE TABLE link (time int64, src string, dst string, primary key (src, dst));
+
+INSERT INTO link VALUES (100, 'alice', 'bob');
+INSERT INTO link VALUES (200, 'carl', 'dave');
+INSERT INTO link VALUES (300, 'bob', 'alice');
+```
+
+After `EncodeKey`, each row becomes one KV pair (`table + 0x00 + PK columns`):
+
+```text
+key1 = "link\0alice\0bob"    val1 = encoded(time=100)
+key2 = "link\0carl\0dave"    val2 = encoded(time=200)
+key3 = "link\0bob\0alice"    val3 = encoded(time=300)
+```
+
+The **log on disk** and the **public API** (`Get` / `Set` / `SetEx`) are the same in 0305 and 0401. Only **how RAM is organized** changes.
+
+#### 0305 — `mem map[string][]byte` (unordered hash map)
+
+```go
+type KV struct {
+    log Log
+    mem map[string][]byte
+}
+```
+
+After the three inserts, RAM might look like this (order is arbitrary — hash buckets):
+
+```text
+kv.mem = {
+    "link\0bob\0alice"  →  [bytes for time=300]
+    "link\0alice\0bob"  →  [bytes for time=100]
+    "link\0carl\0dave"  →  [bytes for time=200]
+}
+```
+
+* **No order** — map iteration order is random.
+* **One structure** — key and value live together in each map entry.
+* **Lookup** — `Get(key)` → `mem[string(key)]` → O(1) hash hit.
+
+```go
+// 0305 Get
+val, ok = kv.mem[string(key)]
+```
+
+```text
+Get("link\0bob\0alice")
+  → hash("link\0bob\0alice")
+  → bucket → return val3 immediately
+```
+
+You never search other keys — but you also **cannot** ask for “the next key after `bob`.” There is no “next.”
+
+#### 0401 — `keys [][]byte` + `vals [][]byte` (sorted parallel arrays)
+
+```go
+type KV struct {
+    log  Log
+    keys [][]byte   // sorted
+    vals [][]byte   // vals[i] belongs to keys[i]
+}
+```
+
+Same three rows, but RAM is **two aligned slices**, sorted by `bytes.Compare` on the full key:
+
+```text
+index:   0                    1                    2
+keys:  [ "link\0alice\0bob",  "link\0bob\0alice",  "link\0carl\0dave" ]
+vals:  [ val1 (time=100),     val3 (time=300),     val2 (time=200)     ]
+         └──────────────────────── aligned ────────────────────────────┘
+
+Sort order:  alice/bob  <  bob/alice  <  carl/dave
+```
+
+* **Strict order** — index 0 is smallest key, index 2 is largest.
+* **Two parallel arrays** — `keys[i]` always pairs with `vals[i]`.
+* **Lookup** — binary search on `keys`, then index into `vals`.
+
+```go
+// 0401 Get
+idx, ok := slices.BinarySearchFunc(kv.keys, key, bytes.Compare)
+if ok { return kv.vals[idx], true, nil }
+```
+
+```text
+Get("link\0bob\0alice")
+
+keys = [ alice/bob, bob/alice, carl/dave ]
+              0         1          2
+
+Binary search → keys[1] == target → return vals[1]  (time=300)
+```
+
+Still **one** targeted lookup (O(log N)), not a scan of all keys.
+
+#### Side-by-side
+
+```text
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 0305 (hash map)                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│  mem: unordered bag of entries                                          │
+│    "link\0bob\0alice"  ──→  val3                                        │
+│    "link\0alice\0bob"  ──→  val1     (physical order = random)        │
+│    "link\0carl\0dave"  ──→  val2                                        │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 0401 (sorted twin slices)                                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│  keys[0] = "link\0alice\0bob"     vals[0] = val1                      │
+│  keys[1] = "link\0bob\0alice"     vals[1] = val3   ← sorted order     │
+│  keys[2] = "link\0carl\0dave"     vals[2] = val2                      │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+Same keys, same values — different **in-memory container**.
+
+#### Inserting a 4th row — where the difference shows
+
+```sql
+INSERT INTO link VALUES (150, 'bob', 'carl');
+```
+
+New key: `"link\0bob\0carl"` (sorts between `bob/alice` and `carl/dave`).
+
+**0305:** `mem["link\0bob\0carl"] = val4` — O(1), no shifting.
+
+**0401:**
+
+```text
+Binary search → idx=2
+
+Before:  [ alice/bob, bob/alice, carl/dave ]
+After:   [ alice/bob, bob/alice, bob/carl, carl/dave ]
+                              ↑ inserted at index 2; carl/dave shifts right
+```
+
+That shift is the O(N) insert penalty from §2.
+
+#### Schema keys use the same KV
+
+`CREATE TABLE` stores metadata at `@schema_link`. Row keys and schema keys share one namespace — 0401 keeps them all in the same sorted `keys`/`vals` slices (e.g. `"@schema_link"` sorts before `"link\0…"` because `@` < `l`).
+
+| | 0305 | 0401 |
+| :--- | :--- | :--- |
+| **Mental model** | Dictionary: `{key → value}` | Two columns: sorted `keys[]` + matching `vals[]` |
+| **Find row** | Hash to exact key | Binary search exact key |
+| **Walk in order** | Impossible | Enabled in 0402+ (`Next()` from index) |
+
 ---
 
 ## 9. `Open()` — Sort + Compact (New Recovery Path)
