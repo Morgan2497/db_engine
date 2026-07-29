@@ -2,6 +2,32 @@
 
 > **Course map:** Storage goes ordered (`keys[]` / `vals[]`); SQL and `DB` API stay the same. See [repo README](../README.md) for how 04xx fits after 0305.
 
+## Overview: What This Chapter Changes
+
+Through **0305**, the engine is fully functional: SQL parses, `ExecStmt` runs, rows encode/decode, and the KV layer persists via log + CRC + `fsync`. **0401 changes only `kv.go`** — the storage basement.
+
+```text
+0305                              0401
+────                              ────
+KV.mem = map[string][]byte   →    KV.keys [][]byte  (sorted)
+                                  KV.vals [][]byte  (parallel values)
+
+Same public API:  Get / Set / SetEx / Del / Open / Close
+Same above KV:    sql_parser.go, table.go, row.go, ExecStmt
+```
+
+| Layer | Changed in 0401? |
+| :--- | :---: |
+| SQL parser + AST | No |
+| `ExecStmt` / `table.go` | No |
+| `Row.EncodeKey` / `EncodeVal` | No |
+| Log, CRC, tombstones | No |
+| **`KV` in-memory layout** | **Yes** |
+
+**Milestone tests:** `go test -v` — especially `TestKVRecovery` (new `Open()` compaction) and `TestSQLByPKey` (proves SQL still works after reopen).
+
+---
+
 ## 1. Architectural Transition: Beyond Point Lookups
 
 A primitive Key-Value (KV) engine built on top of an unordered Hash Map handles point lookups ($O(1)$ operations like `GET`, `SET`, and `DEL`) with high efficiency. However, hash tables lack structural order, making them incapable of supporting fundamental relational database capabilities. 
@@ -205,6 +231,209 @@ kv := &KV{
 key := []byte("post:25")
 ```
 
+Binary search on `keys` for `"post:25"` → `idx=1`, `ok=false` (insertion index between `"post:20"` and `"post:30"`).
 
+```text
+Get("post:20"):
+  BinarySearchFunc(keys, "post:20", bytes.Compare)
+  → idx=1, ok=true
+  → return vals[1]   // O(log N)
+
+SetEx("post:25", val, ModeUpsert) when key is new:
+  → idx=1, exist=false
+  → log.Write(...)
+  → slices.Insert(keys, 1, "post:25")
+  → slices.Insert(vals, 1, val)   // O(N) shift — see §2
 ```
+
+---
+
+## 8. What Changed vs 0305 (`kv.go` only)
+
+| Piece | 0305 | 0401 |
+| :--- | :--- | :--- |
+| Struct | `mem map[string][]byte` | `keys [][]byte` + `vals [][]byte` |
+| `Open()` | Replay log in file order → map | Read all → **sort by key** → **compact** → arrays |
+| `Get` | `mem[string(key)]` — O(1) | `slices.BinarySearchFunc` — O(log N) |
+| `SetEx` insert | `mem[k]=v` | `slices.Insert` at sorted index |
+| `SetEx` update | `mem[k]=v` | `vals[idx]=v` in place (no shift) |
+| `Del` | `delete(mem,k)` | `slices.Delete` at index |
+
+`SetEx` mode semantics (`ModeInsert` / `ModeUpdate` / `ModeUpsert`) are **unchanged** from 0203.
+
+---
+
+## 9. `Open()` — Sort + Compact (New Recovery Path)
+
+0305 replayed the log **in append order**; last write per key wins naturally. Sorted arrays have no random-access-by-key during replay, so 0401 uses a three-phase rebuild:
+
+```text
+Phase 1 — READ ALL
+  entries = every log record (messy history)
+
+Phase 2 — SORT BY KEY (stable)
+  slices.SortStableFunc(entries, bytes.Compare on key)
+  same key → entries stay in chronological order
+
+Phase 3 — COMPACT
+  walk sorted entries; for each key, latest entry wins
 ```
+
+### Hand trace (`TestKVRecovery`)
+
+Log in append order:
+
+```text
+1. Set  user1 → "Morgan"
+2. Set  user2 → "Alice"
+3. Set  user1 → "Morgan Kim"
+4. Del  user2
+```
+
+After stable sort by key:
+
+```text
+user1 → "Morgan"        (older)
+user1 → "Morgan Kim"    (newer)
+user2 → "Alice"
+user2 → (tombstone)
+```
+
+Compaction walk:
+
+| Step | Entry | Action | `keys` after |
+| :---: | :--- | :--- | :--- |
+| 1 | user1="Morgan" | append | `[user1]` |
+| 2 | user1="Morgan Kim" | pop previous same key, append | `[user1]` val="Morgan Kim" |
+| 3 | user2="Alice" | append | `[user1, user2]` |
+| 4 | user2 deleted | pop user2, skip append | `[user1]` |
+
+The pop logic:
+
+```go
+if n > 0 && bytes.Equal(kv.keys[n-1], ent.key) {
+    kv.keys, kv.vals = kv.keys[:n-1], kv.vals[:n-1]
+}
+```
+
+After sorting, duplicate keys are **adjacent**. Stable sort preserves time order within each key group.
+
+---
+
+## 10. Operation Walkthroughs
+
+### `Get` — point lookup
+
+```go
+idx, ok := slices.BinarySearchFunc(kv.keys, key, bytes.Compare)
+if ok { return kv.vals[idx], true, nil }
+```
+
+| `ok` | `idx` means |
+| :---: | :--- |
+| `true` | Exact index of `key` |
+| `false` | Insertion index to keep sorted order |
+
+Example: `keys = ["a", "c", "f"]` — search `"b"` → `idx=1`, `ok=false`.
+
+### `SetEx` — insert vs update
+
+```text
+idx, exist := BinarySearchFunc(...)
+
+exist=true  → log.Write → vals[idx] = val     (update in place)
+exist=false → log.Write → slices.Insert keys/vals at idx
+```
+
+Mode truth table (same as 0203):
+
+| Mode | Key missing | Key exists, same val | Key exists, new val |
+| :--- | :--- | :--- | :--- |
+| Upsert | insert | no-op | overwrite |
+| Insert | insert | no-op | no-op |
+| Update | no-op | no-op | overwrite |
+
+### `Del` — tombstone + slice delete
+
+```text
+1. BinarySearchFunc → idx, exist
+2. if !exist → return false
+3. log.Write(tombstone) FIRST
+4. slices.Delete(keys, idx, idx+1)
+5. slices.Delete(vals, idx, idx+1)
+```
+
+Remaining keys stay sorted.
+
+---
+
+## 11. SQL Still Works — End-to-End Stack
+
+An `INSERT` through 0401 is identical to 0305 above the KV layer:
+
+```text
+INSERT INTO link VALUES (123, 'bob', 'alice')
+  → parseStmt (0304) → StmtInsert
+  → execInsert (0305)
+  → db.Insert (0204) → EncodeKey + EncodeVal
+  → kv.SetEx(..., ModeInsert) (0203)
+  → ★ binary search + slices.Insert ★ (0401)
+  → log.Write + fsync (0103–0105)
+```
+
+`TestSQLByPKey` closes and reopens the DB — if `Open()` compaction is wrong, DELETE after reopen fails even when in-memory ops looked fine.
+
+### Multiple tables — not a schema scan
+
+All tables share one KV, but row keys are **namespaced** by table prefix (`EncodeKey` prepends `table + 0x00`). A `SELECT … FROM link WHERE pk=…` does **not** search all schemas:
+
+```text
+GetSchema("link")           → 1 lookup (@schema_link or RAM cache)
+EncodeKey → "link\0bob\0alice"
+KV.Get(exact key)           → 1 lookup (not random, not all 4 tables)
+```
+
+---
+
+## 12. Complexity Cheat Sheet
+
+| Operation | Map (0305) | Sorted array (0401) |
+| :--- | :--- | :--- |
+| Get | O(1) | O(log N) |
+| Update existing | O(1) | O(log N), no shift |
+| Insert new | O(1) | O(log N) + **O(N) shift** |
+| Delete | O(1) | O(log N) + **O(N) shift** |
+| Range scan | impossible | enabled in 0402+ |
+| `Open()` replay | O(entries) | O(entries log entries) sort |
+
+0401 trades hash-map speed for **order**. B-trees and LSM-trees (§3) exist to keep order without O(N) shifts on every insert.
+
+---
+
+## 13. Tests to Run
+
+```bash
+cd 0401 && go test -v
+```
+
+| Test | What it proves |
+| :--- | :--- |
+| `TestKVBasic` | set/get/del on sorted storage |
+| `TestKVUpdateMode` | `ModeInsert` / `ModeUpdate` / `ModeUpsert` |
+| `TestKVRecovery` | **new** sort+compact `Open()` |
+| `TestTableByPKey` | relational CRUD unchanged |
+| `TestSQLByPKey` | full SQL + reopen after 0401 storage |
+
+---
+
+## 14. What's Next (0402)
+
+0401 gives **sorted data** but no way to walk it yet. Chapter **0402** adds:
+
+```text
+kv.Seek(key) → *KVIterator
+iter.Next() / iter.Prev()
+iter.Key() / iter.Val()
+```
+
+That is when table scans and range queries become possible at the storage layer. **0403** fixes sort-correct encoding; **0404** wraps iterators into table-scoped `RowIterator`.
