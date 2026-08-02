@@ -12,7 +12,7 @@ SQL text
 parseStmt() ──► AST (interface{})
    │
    ▼
-ExecStmt() ──► GetSchema → makeRow/makePKey → KV → SQLResult
+ExecStmt() ──► GetSchema → makePKey / validate → KV → SQLResult
 ```
 
 ```text
@@ -133,18 +133,22 @@ Schemas survive `Close`/`Open` because they live in the durable KV log like any 
 ```text
 StmtCreateTable
    │
-   ├─ build Schema{Cols, PKey indices}
+   ├─ GetSchema succeeds? → "duplicate table name"
+   │     (err == nil means the table already exists)
+   ├─ build Schema{Cols, PKey indices via lookupColumns}
    ├─ json.Marshal → KV.Set("@schema_"+table)
    └─ db.tables[table] = schema
 ```
 
 ### DML — `INSERT`
 
+Values are **positional** — `stmt.value[i]` must match `schema.Cols[i]` (count + type). No `makeRow`; the parser already built `[]Cell` in column order.
+
 ```text
-values (123, 'bob', 'alice')
+VALUES (123, 'bob', 'alice')
    │
    ▼
-makeRow / align to columns
+GetSchema → len/type check vs schema.Cols
    │
    ▼
 EncodeKey + EncodeVal
@@ -152,6 +156,8 @@ EncodeKey + EncodeVal
    ▼
 SetEx(..., ModeInsert) → Updated=1 or 0
 ```
+
+Duplicate PK is not an error: `ModeInsert` refuses the write and returns `Updated=0`.
 
 ### DML — `UPDATE` (Read-Modify-Write)
 
@@ -186,6 +192,7 @@ WHERE … → makePKey → EncodeKey → Del → Updated=0|1
 ```text
 SELECT time FROM link WHERE dst='alice' AND src='bob';
    │
+   ├─ lookupColumns → projection indices
    ├─ makePKey from WHERE
    ├─ Get + DecodeVal
    └─ subsetRow → only ["time"]
@@ -197,6 +204,7 @@ SQLResult{
 }
 ```
 
+Missing row → empty `Values`, `err=nil` (not an error). Point lookup only — 0 or 1 row.
 ---
 
 ## 4. End-to-End Mock (From Tests)
@@ -247,9 +255,9 @@ SQLResult{
 
 | Helper | Job |
 | :--- | :--- |
-| `lookupColumns` | name → column index |
-| `makePKey` | WHERE `NamedCell`s → PK-shaped `Row` |
-| `makeRow` | INSERT values → full `Row` |
+| `lookupColumns` | name → column index (CREATE PK list, SELECT projection) |
+| `makePKey` | WHERE `NamedCell`s → PK-shaped `Row` (WHERE order ignored; schema `PKey` order wins) |
+| `makeRow` | named columns + values → full `Row` (available; `execInsert` uses positional values instead) |
 | `subsetRow` | projection for SELECT header |
 | `fillNonPKey` | apply UPDATE assignments; block PK writes |
 | `ExecStmt` | type-switch router |
@@ -303,6 +311,8 @@ You now have a vertical slice: **SQL string → durable typed row** — limited,
 
 * `ExecStmt` is the traffic controller; `SQLResult` is the universal reply.
 * Schemas are data too: `@schema_*` JSON in KV + RAM cache.
+* CREATE rejects duplicates when `GetSchema` succeeds (`err == nil` ⇒ table exists).
+* INSERT is positional; duplicate PK yields `Updated=0`, not an error.
 * UPDATE is read-modify-write with PK write-protection.
-* SELECT projects columns after a point Get — not a table scan.
+* SELECT projects columns after a point Get — missing row is empty `Values`, not an error.
 * Next chapters grow ordering, indexes, and richer query plans on this foundation.

@@ -47,6 +47,7 @@ func (db *DB) GetSchema(table string) (Schema, error) {
 		if !ok {
 			return Schema{}, errors.New("table is not found")
 		}
+		// cache for future lookups
 		db.tables[table] = schema
 	}
 	return schema, nil
