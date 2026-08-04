@@ -311,14 +311,14 @@ Because Chapter 0403 made each cell encoding order-preserving, complete tuples c
 (a, b, c) <= (123, 4, 5)
 ```
 
-Range queries may also provide only a prefix:
+Range queries may also provide only a prefix. A prefix means that the first columns are specified, but the remaining columns are unspecified:
 
 ```text
 (a, b) <= (123, 4)
 a      <= 123
 ```
 
-The missing columns cannot simply be ignored. The database must decide whether the omitted suffix should behave like the smallest possible value or the largest possible value.
+The issue is not merely that the key lengths differ. The KV layer can compare byte arrays of different lengths. The real issue is that the omitted suffix needs a defined meaning: should it behave like the smallest possible value or the largest possible value?
 
 For example:
 
@@ -348,7 +348,108 @@ must exclude every key beginning with `(123, 4)`. Its full-tuple boundary behave
 
 ## 7. Converting Prefix Comparisons to Full-Key Bounds
 
-The four comparison operators map to synthetic suffixes as follows:
+This section explains how a partial comparison becomes a comparison between complete keys.
+
+Assume the primary key contains three columns:
+
+```text
+(a, b, c)
+```
+
+A complete key might be:
+
+```text
+(1, 2, 5)
+```
+
+The expression `(1, 2)` is a prefix. It means:
+
+```text
+a = 1
+b = 2
+c = anything
+```
+
+Therefore, all of these keys belong to the `(1, 2)` prefix group:
+
+```text
+(1, 2, 1)
+(1, 2, 5)
+(1, 2, 100)
+```
+
+Composite keys are compared from left to right: compare `a` first, then `b` if `a` is equal, then `c` if both earlier values are equal.
+
+### The meaning of `-∞` and `+∞`
+
+These are not real database values. They are boundary markers for the prefix group:
+
+```text
+(1, 2, -∞)  ← immediately before the group
+(1, 2, 1)
+(1, 2, 5)
+(1, 2, 100)
+(1, 2, +∞)  ← immediately after the group
+```
+
+In plain language:
+
+- `(1, 2, -∞)` means the beginning of the `(1, 2, ...)` group.
+- `(1, 2, +∞)` means the end of the `(1, 2, ...)` group.
+
+### 1. Strict upper bound: `<`
+
+```text
+Prefix expression:  (a, b) < (1, 2)
+Full-key form:      (a, b, c) <= (1, 2, -∞)
+```
+
+The query must exclude every key beginning with `(1, 2)`. Because every real `c` is greater than `-∞`, real keys such as `(1, 2, 1)` and `(1, 2, 100)` fail the `<= (1, 2, -∞)` check.
+
+The boundary stops immediately before the `(1, 2, ...)` group.
+
+### 2. Inclusive upper bound: `<=`
+
+```text
+Prefix expression:  (a, b) <= (1, 2)
+Full-key form:      (a, b, c) <= (1, 2, +∞)
+```
+
+The query must include every key beginning with `(1, 2)`. Because every real `c` is less than `+∞`, keys such as `(1, 2, 1)`, `(1, 2, 5)`, and `(1, 2, 100)` all pass the upper-bound check.
+
+The `+∞` boundary is placed after the entire group.
+
+### 3. Strict lower bound: `>`
+
+```text
+Prefix expression:  (a, b) > (1, 2)
+Full-key form:      (a, b, c) >= (1, 2, +∞)
+```
+
+The query must skip every key beginning with `(1, 2)`. Every real key in that group is less than `(1, 2, +∞)`, so it fails the lower-bound check. The scan begins only after the entire `(1, 2, ...)` group.
+
+### 4. Inclusive lower bound: `>=`
+
+```text
+Prefix expression:  (a, b) >= (1, 2)
+Full-key form:      (a, b, c) >= (1, 2, -∞)
+```
+
+The query must include every key beginning with `(1, 2)`. Every real key in that group is greater than `(1, 2, -∞)`, so it passes the lower-bound check. The scan begins at the start of the `(1, 2, ...)` group.
+
+### The rule to remember
+
+```text
+Upper bound:
+    <   → -∞  (stop before the group)
+    <=  → +∞  (include the entire group)
+
+Lower bound:
+    >=  → -∞  (start at the group)
+    >   → +∞  (start after the group)
+```
+
+The complete mapping is:
 
 | Prefix condition | Equivalent full-key boundary | Synthetic suffix |
 |---|---|---|
@@ -356,19 +457,6 @@ The four comparison operators map to synthetic suffixes as follows:
 | `(a,b) <= (1,2)` | `(a,b,c) <= (1,2,+∞)` | `+∞` |
 | `(a,b) > (1,2)` | `(a,b,c) >= (1,2,+∞)` | `+∞` |
 | `(a,b) >= (1,2)` | `(a,b,c) >= (1,2,-∞)` | `-∞` |
-
-This produces the helper rule:
-
-```text
-<   → -∞
-<=  → +∞
->   → +∞
->=  → -∞
-```
-
-Why does strict `>` use `+∞`? Because starting after `(1,2,+∞)` skips every real key whose prefix is `(1,2)`.
-
-Why does inclusive `>=` use `-∞`? Because starting at `(1,2,-∞)` includes every real key whose prefix is `(1,2)`.
 
 ---
 
