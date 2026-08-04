@@ -1,7 +1,7 @@
 # Chapter 0404: Row Iterator
 
 ## Overview: Bridging the Physical KV Layer to the Relational Layer
-In Chapter 0403, we solved the physical storage sorting problem by implementing order-preserving serialization, ensuring that our Key-Value (KV) store stores primary keys as sorted, contiguous byte sequences. However, raw bytes alone cannot power a relational database engine.
+In Chapter 0403, we solved the physical storage sorting problem by implementing order-preserving serialization. Primary keys can now be represented as byte sequences whose lexicographic order matches their logical order. However, raw bytes alone cannot power a relational database engine.
 
 A modern database engine operates across two distinct architectural abstractions:
 1. **The Physical/Storage Layer:** Operates via a raw `KVIterator`, which blindly streams raw byte slices (`[]byte` keys and values) across disk blocks or memory tables using simple lexicographical byte-by-byte comparisons (`bytes.Compare()`). It has zero awareness of schemas, data types, columns, or tables.
@@ -11,6 +11,28 @@ A modern database engine operates across two distinct architectural abstractions
 
 This chapter introduces the **Row Iterator**, the core architectural component that bridges the raw `KVIterator` to the relational `Row` model.
 
+### At a glance
+
+The chapter implements this pipeline:
+
+```text
+logical starting row
+        ↓
+    EncodeKey
+        ↓
+      Seek
+        ↓
+ sorted raw KV entries
+        ↓
+ prefix validation
+        ↓
+ DecodeKey + DecodeVal
+        ↓
+ cached RowIterator.row
+```
+
+The result is a table-aware iterator that exposes decoded `Row` values while the underlying KV engine continues to operate only on bytes.
+
 ---
 
 ## 1. The Multi-Table Co-Location Problem (The Namespace Bug)
@@ -19,16 +41,16 @@ To understand why an advanced iterator wrapper is necessary, we must examine how
 A database engine does not create a separate physical file or independent storage instance for every table. Instead, **all tables share a single, unified KV store namespace**. Because primary keys are serialized into raw byte arrays and sorted lexicographically using `bytes.Compare()`, the physical storage layer has no concept of relational tables. It just sees one massive, continuous stream of sorted bytes where the rows for different tables are interleaved.
 
 ### Mock Physical Storage View
-Imagine your KV store contains rows for two different tables: `users` and `orders`. Because `u` comes alphabetically before `o`, their raw physical bytes look like this on disk:
+Imagine your KV store contains rows for two different tables: `users` and `orders`. Because `o` comes before `u` in lexicographic byte order, their raw physical bytes look like this on disk:
 
 ```text
 Physical Disk Address | Raw Key Bytes                          | Value
 -----------------------------------------------------------------------
-Disk Block #101       | "users\x00\x00\x00\x00\x00\x00\x00\x01" | Alice
-Disk Block #102       | "users\x00\x00\x00\x00\x00\x00\x00\x02" | Bob
---- END OF USERS TABLE ------------------------------------------------
-Disk Block #103       | "orders\x00\x00\x00\x00\x00\x00\x00\x01" | Laptop ($999)
-Disk Block #104       | "orders\x00\x00\x00\x00\x00\x00\x00\x02" | Phone ($699)
+Disk Block #101       | "orders\x00\x00\x00\x00\x00\x00\x00\x01" | Laptop ($999)
+Disk Block #102       | "orders\x00\x00\x00\x00\x00\x00\x00\x02" | Phone ($699)
+--- END OF ORDERS TABLE ------------------------------------------------
+Disk Block #103       | "users\x00\x00\x00\x00\x00\x00\x00\x01"  | Alice
+Disk Block #104       | "users\x00\x00\x00\x00\x00\x00\x00\x02"  | Bob
 ```
 
 ### Why a "Blind Scan" is Dangerous (The Analogy)
@@ -49,9 +71,9 @@ for iter.Valid() {
 ```
 
 #### The Analogy: Reading a Book Without Chapter Headers
-Imagine Chapter 1 (`users`) and Chapter 2 (`orders`) are printed back-to-back in a massive, unformatted book. You are assigned to read *only* Chapter 1.
-* **Without the Prefix Guard:** You read User 1, User 2... and reach the end of Chapter 1. Your read-head crosses the invisible line and enters Chapter 2 (`orders`). Because you aren't checking for boundaries, you keep reading: *"Order #1: Laptop, Order #2: Phone..."* thinking they are still users. You end up dumping financial orders into a report meant only for user profiles.
-* **With the Prefix Guard:** The moment your read-head touches the first byte of Chapter 2 (`orders\x00...`), the decoder says, *"Wait, this doesn't start with `users\x00`!"* It triggers `ErrOutOfRange`, stops the loop immediately, and your `users` query finishes cleanly without leaking order data.
+Imagine Chapter 1 (`orders`) and Chapter 2 (`users`) are printed back-to-back in a massive, unformatted book. You are assigned to read *only* Chapter 1.
+* **Without the Prefix Guard:** You read Order 1, Order 2, and then continue into the users table, interpreting unrelated rows as orders.
+* **With the Prefix Guard:** The first key that does not begin with `orders\x00` causes the decoder to return `ErrOutOfRange`. The iterator marks itself invalid, and the `orders` scan ends cleanly.
 
 ### The Solution: The Table-Prefix Guard
 To prevent data leaks, every table key is prepended with its table name plus a null terminator (`schema.Table + "\x00"`). As the iterator scans, it dynamically inspects incoming byte keys and immediately halts the moment a key steps outside the target table's namespace.
@@ -90,9 +112,9 @@ When we write `len(key) < len(schema.Table) + 1`, we are checking if a raw byte 
 In standard software engineering, an error usually indicates an exceptional failure (such as a disk read failure, null pointer, or network timeout). In database execution engines, **`ErrOutOfRange` is a vital control-flow primitive.** It acts as a polite boundary signal telling the iterator that it has hit the physical end of the table's contiguous storage space and should stop scanning.
 
 ### Mock Scenario: Hitting the Table Edge
-1. The iterator is scanning the `users` table and processes `[Key: "users\x00...2"]`. Success.
-2. The iterator calls `Next()` and moves to the next physical key on disk: `[Key: "orders\x00...1"]`.
-3. The decoding function inspects the prefix, sees that `"orders"` does not match `"users"`, and returns `ErrOutOfRange`.
+1. The iterator is scanning the `orders` table and processes `[Key: "orders\x00...2"]`. Success.
+2. The iterator calls `Next()` and moves to the next physical key on disk: `[Key: "users\x00...1"]`.
+3. The decoding function inspects the prefix, sees that `"users"` does not match `"orders"`, and returns `ErrOutOfRange`.
 4. Instead of crashing the query, the `RowIterator` intercepts this, sets its internal `valid` flag to `false`, and tells the SQL execution loop: *"The scan is complete. Stop pulling rows."*
 
 ---
