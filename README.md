@@ -1,20 +1,22 @@
 # db_engine — Course Map
 
-A chapter-by-chapter build of a database engine in Go. Each folder (`0101/`, `0204/`, `0305/`, …) is a self-contained snapshot you can `cd` into and `go test -v`.
+A chapter-by-chapter build of a database engine in Go. Each folder (`0101/`, `0204/`, `0305/`, `0405/`, `0501/`, …) is a self-contained snapshot you can `cd` into and `go test -v`.
 
 This document is the **index**: what each chapter owns, which operations exist at each layer, and how SQL flows down to bytes on disk.
 
 ---
 
-## Architecture: Four Layers
+## Architecture: Five Layers
 
 ```text
 ┌─────────────────────────────────────────────────────────────────┐
-│  03xx  SQL text  →  tokens  →  AST  →  ExecStmt  →  SQLResult   │  language
+│  05xx  expressions → trees → precedence → later evaluation      │  expressions
+├─────────────────────────────────────────────────────────────────┤
+│  03xx  SQL text → statement AST → ExecStmt → SQLResult           │  language
 ├─────────────────────────────────────────────────────────────────┤
 │  02xx  Schema / Row / DB.Insert|Select|Update|Delete            │  relational
 ├─────────────────────────────────────────────────────────────────┤
-│  04xx  sorted keys, Seek, iterators, order-preserving encoding  │  ordered access
+│  04xx  sorted keys, bounded ranges, order-preserving encoding    │  ordered access
 ├─────────────────────────────────────────────────────────────────┤
 │  01xx  KV.Get / Set / Del / log / fsync / CRC / Open replay     │  storage
 └─────────────────────────────────────────────────────────────────┘
@@ -69,14 +71,27 @@ This document is the **index**: what each chapter owns, which operations exist a
 | **0402** | Iterator abstraction | `Seek`, `KVIterator.Next` / `Prev` |
 | **0403** | Sort-correct encoding | order-preserving `EncodeKey` for ints / strings |
 | **0404** | Table-scoped row scan | `DB.Seek`, `RowIterator` |
+| **0405** | Inclusive bounded and prefix ranges | `RangeReq`, `EncodeKeyPrefix`, `KV.Range`, `RangedKVIter` |
 
-**Milestone:** walk rows in key order without random `Get` per guess.
+**Milestone:** walk rows in either direction inside encoded start/stop boundaries, including complete composite-key prefix groups.
+
+### 05xx — Expressions: “How does flat SQL become a computation tree?”
+
+| Ch | Responsibility | New operations |
+|----|----------------|----------------|
+| **0501** | Infix expressions and left-associative trees | `ExprBinOp`, `parseAtom`, `parseAdd` |
+
+**Milestone:** parse `a - b + c - e` into the explicit tree `(((a - b) + c) - e)`.
+
+Chapter 0501 deliberately builds only the tree. Evaluation, additional
+precedence levels, parentheses, and the complete SQL operator set arrive in
+later 05xx chapters. See the [detailed Chapter 0501 notes](0501/README.md).
 
 ---
 
 ## Operations by Layer
 
-### Storage (`KV`) — 01xx + 0401–0402
+### Storage (`KV`) — 01xx + 0401–0405
 
 | Operation | What it does | Introduced | Used when |
 |-----------|--------------|------------|-----------|
@@ -90,8 +105,9 @@ This document is the **index**: what each chapter owns, which operations exist a
 | `SetEx` + modes | Insert-only / update-only / upsert | **0203** | SQL `INSERT` vs `UPDATE` semantics |
 | Sorted `keys[]` / `vals[]` | Ordered storage | **0401** | Foundation for scans |
 | `Seek` + `KVIterator` | Position at key, walk forward/back | **0402** | Range queries, table scans |
+| `KV.Range` + `RangedKVIter` | Enforce an inclusive stop key in either direction | **0405** | Bounded ascending/descending scans |
 
-### Relational (`DB`) — 02xx + 0404
+### Relational (`DB`) — 02xx + 0404–0405
 
 | Operation | What it does | Introduced | Used when |
 |-----------|--------------|------------|-----------|
@@ -103,8 +119,10 @@ This document is the **index**: what each chapter owns, which operations exist a
 | `Delete` | Remove row by PK | **0204** | `DELETE … WHERE pk = …` |
 | `GetSchema` | Load table definition | **0305** | Before any SQL exec |
 | `DB.Seek` / `RowIterator` | Scan rows in key order for one table | **0404** | `SELECT *`, range filters |
+| `DB.Range` / `RangeReq` | Convert logical comparisons to encoded range bounds | **0405** | `<`, `<=`, `>`, `>=`, prefix scans |
+| `EncodeKeyPrefix` | Place a synthetic boundary before or after a prefix group | **0405** | Inclusive/strict composite-key bounds |
 
-### SQL — 03xx
+### SQL and expressions — 03xx + 0501
 
 | Operation | What it does | Introduced | Used when |
 |-----------|--------------|------------|-----------|
@@ -113,6 +131,9 @@ This document is the **index**: what each chapter owns, which operations exist a
 | `parseSelect` → `StmtSelect` | AST for PK `SELECT` | **0303** | Point-query SELECT |
 | `parseStmt` | CREATE / INSERT / UPDATE / DELETE too | **0304** | Full SQL surface |
 | `ExecStmt` | Run AST against `DB` | **0305** | End-to-end SQL |
+| `ExprBinOp` | Store an operator with left/right child expressions | **0501** | Expression tree nodes |
+| `parseAtom` | Parse a column name or literal leaf | **0501** | Leaves of an expression tree |
+| `parseAdd` | Build a left-associative `+`/`-` tree | **0501** | Basic infix expressions |
 
 ---
 
@@ -172,16 +193,39 @@ Example schema: `link(time int64, src string, dst string, primary key (src, dst)
 0101  kv.Del      → tombstone + remove from mem
 ```
 
-### `SELECT * FROM link WHERE src > 'bob'` (future, 04xx)
+### Bounded row range (0405 relational API)
 
 ```text
-0404  RowIterator over table prefix
-0403  order-preserving EncodeKey (byte order = logical order)
-0402  KVIterator.Seek + Next
+0405  RangeReq comparisons → synthetic ±∞ suffixes
+0405  EncodeKeyPrefix → encoded start/stop keys
+0405  DB.Range → RowIterator
+0405  KV.Range → RangedKVIter.Valid + Next
+0403  order-preserving key bytes
+0402  KVIterator.Seek + Next/Prev
 0401  sorted keys array
 ```
 
-Through **0305**, every SQL statement still ends in **`Get`**, **`SetEx`**, or **`Del`** — all point lookups. Range scans and full table scans arrive in **04xx**.
+The bounded range machinery exists in 0405, while SQL range-expression
+integration is developed through the expression chapters. Chapter 0501 first
+turns simple infix input into a tree; it does not evaluate that tree yet.
+
+### `a - b + c - e` (0501 expression parsing)
+
+```text
+0501  parseAdd
+        ↓ parseAtom leaves from left to right
+      a, b, c, e
+        ↓ wrap the expression constructed so far
+      (((a - b) + c) - e)
+        ↓ in-memory tree
+            -
+           / \
+          +   e
+         / \
+        -   c
+       / \
+      a   b
+```
 
 ---
 
@@ -194,7 +238,8 @@ Through **0305**, every SQL statement still ends in **`Get`**, **`SetEx`**, or *
 | Change row | `ExecStmt(UPDATE)` | `Update` | `Get` + `SetEx(Update)` |
 | Remove row | `ExecStmt(DELETE)` | `Delete` | `Del` |
 | Define table | `CREATE TABLE` | store schema in KV | `Set` on `@schema_*` key |
-| Scan many rows | (later SQL) | `RowIterator` (0404) | `Seek` + `Next` (0402) |
+| Scan many rows | range expressions are being developed in 05xx | `DB.Range` / `RowIterator` (0405) | `Range` + `Next`/`Prev` (0405) |
+| Parse arithmetic structure | `parseAdd` (0501) | — | — |
 | Survive restart | — | `db.Open` | `kv.Open` replay log |
 
 ---
@@ -210,7 +255,9 @@ Through **0305**, every SQL statement still ends in **`Get`**, **`SetEx`**, or *
   ↓
 0301 → 0305     SQL compiler + executor
   ↓
-0401 → 0404     ordering + scans
+0401 → 0405     ordering + bounded prefix scans
+  ↓
+0501 onward     expression trees, evaluation, precedence
 ```
 
 ### Already at 0305? Fill gaps, then continue 04xx
@@ -218,7 +265,8 @@ Through **0305**, every SQL statement still ends in **`Get`**, **`SetEx`**, or *
 1. **0101 + 0103 + 0105** — how `Get` / `Set` / `Del` and `Open()` actually work
 2. **0202 + 0203 + 0204** — how `Insert` / `Select` / `Update` map to KV
 3. **0301–0305** — parser + executor (likely mostly done)
-4. **0401 onward** — new material: order, iterators, scans
+4. **0401–0405** — order, iterators, bounded and prefix scans
+5. **0501 onward** — expression trees, evaluation, and precedence
 
 ### Only care about “when does SQL hit disk?”
 
@@ -228,7 +276,8 @@ Start at **0305** (`ExecStmt`), then drill down on demand:
 - `db.Insert` → **0202** (`EncodeKey`)
 - `db.Insert` → **0203** (`SetEx`)
 - `SetEx` → **0103–0105** (log + fsync + CRC)
-- Scans → **0401–0404**
+- Scans → **0401–0405**
+- Expression parsing → **0501** (`parseAtom`, `parseAdd`, `ExprBinOp`)
 
 ---
 
@@ -244,11 +293,20 @@ Start at **0305** (`ExecStmt`), then drill down on demand:
 | `TestSQLByPKey` | 0305+ | Full SQL + reopen |
 | `TestKVSeek` | 0402+ | Iterator positioning |
 | `TestIterByPKey` | 0404+ | Table-scoped row scan |
+| `TestKVRangedAscending` / `TestKVRangedDescending` | 0405 | Inclusive bounded scans in both directions |
+| `TestParseAtom` | 0501 | Column and literal expression leaves |
+| `TestParseAddBuildsLeftAssociativeTree` | 0501 | Nested left-associative `+`/`-` tree |
 
 Run tests in any chapter:
 
 ```bash
 cd 0305 && go test -v
+```
+
+To print Chapter 0501's expression tree:
+
+```bash
+go test -v ./0501 -run TestParseAddBuildsLeftAssociativeTree
 ```
 
 ---
