@@ -7,28 +7,70 @@ import (
 )
 
 type DB struct {
-	KV KV
+	KV     KV
 	tables map[string]Schema
 }
 
 type SQLResult struct {
-	Updated int 
-	Header []string 
-	Values []Row
+	Updated int
+	Header  []string
+	Values  []Row
 }
 
 type RowIterator struct {
 	schema *Schema
-	iter *KVIterator
-	valid bool // decode result (err != ErrOutofRange), a cached boolean telling if the last move was successful.
-	row Row // decode result, a cached Go struct (row) holding the fully decoded row data.
+	iter   *RangedKVIter
+	valid  bool // decode result (err != ErrOutofRange), a cached boolean telling if the last move was successful.
+	row    Row  // decode result, a cached Go struct (row) holding the fully decoded row data.
+}
+
+type ExprOp uint8
+
+type RangeReq struct {
+	StartCmp ExprOp
+	StopCmp  ExprOp
+	Start    []Cell
+	Stop     []Cell
+}
+
+const (
+	OP_LE ExprOp = 12 // <=
+	OP_GE ExprOp = 13 // >=
+	OP_LT ExprOp = 14 // <
+	OP_GT ExprOp = 15 // >
+)
+
+func suffixPositive(op ExprOp) bool {
+	switch op {
+	case OP_LE, OP_GT:
+		return true
+
+	case OP_LT, OP_GE:
+		return false
+
+	default:
+		panic("invalid comparison operator")
+	}
+}
+
+func isDescending(op ExprOp) bool {
+	switch op {
+	case OP_LE, OP_LT:
+		return true
+
+	case OP_GE, OP_GT:
+		return false
+
+	default:
+		panic("invalid comparison operator")
+	}
 }
 
 // Is iteration finished? (Direct boolean read in RAM)
-func (iter *RowIterator) Valid() bool {return iter.valid}
+func (iter *RowIterator) Valid() bool { return iter.valid }
 
 // Current row accessor (Direct struct read in RAM)
-func (iter *RowIterator) Row() Row {return iter.row}
+func (iter *RowIterator) Row() Row { return iter.row }
 
 func (iter *RowIterator) Next() (err error) {
 	if err = iter.iter.Next(); err != nil {
@@ -45,7 +87,7 @@ It does three things.
 2. Decode and verify the key.
 3. Decode the value.
 */
-func decodeKVIter(schema *Schema, iter *KVIterator, row Row) (bool, error) {
+func decodeKVIter(schema *Schema, iter *RangedKVIter, row Row) (bool, error) {
 	// 1. Check if the raw KV cursor is even active.
 	if !iter.Valid() {
 		return false, nil
@@ -57,7 +99,7 @@ func decodeKVIter(schema *Schema, iter *KVIterator, row Row) (bool, error) {
 		if errors.Is(err, ErrOutOfRange) {
 			return false, nil // hits table boundary.
 		}
-		return  false, err // error occured.
+		return false, err // error occured.
 	}
 
 	// 3. Extract and decode the value payload for remaining columns.
@@ -68,25 +110,25 @@ func decodeKVIter(schema *Schema, iter *KVIterator, row Row) (bool, error) {
 	return true, nil
 }
 
-// the entry point that brdiges relational Row, encodes it in to raw bytes, asks the storage to find the pos.
+// Seek preserves the old open-ended relational scan API by wrapping a bounded
+// ascending KV range whose stop key is the end of this table's namespace.
 func (db *DB) Seek(schema *Schema, row Row) (*RowIterator, error) {
-	// 1. Translate the target relational row into an order-preserving byte key.
-	key := row.EncodeKey(schema)
-	
-	// 2. Position the physical storage curosr at the first key >= target.
-	kvIter, err := db.KV.Seek(key)
+	start := row.EncodeKey(schema)
+
+	// table + 0x00 + 0xff sorts after every real key in this table.
+	stop := EncodeKeyPrefix(schema, nil, true)
+
+	kvIter, err := db.KV.Range(start, stop, false)
 	if err != nil {
 		return nil, err
 	}
 
-	// 3. Initialize our cached state wrapper (RowIterator)
-	iter := &RowIterator {
+	iter := &RowIterator{
 		schema: schema,
-		iter: kvIter,
-		row: schema.NewRow(),
+		iter:   kvIter,
+		row:    schema.NewRow(),
 	}
-	
-	// 4. Immediately decode and validate the intial pos.
+
 	iter.valid, err = decodeKVIter(schema, kvIter, iter.row)
 	if err != nil {
 		return nil, err
@@ -112,7 +154,7 @@ myKV := KV{
 func (db *DB) GetSchema(table string) (Schema, error) {
 	// 1. Attempt to get the schema if exists in map (RAM cache first).
 	schema, ok := db.tables[table]
-	
+
 	if !ok {
 		// 1. Attempt durable read: fallback to the physical KV engine.
 		val, ok, err := db.KV.Get([]byte("@schema_" + table))
@@ -132,22 +174,22 @@ func (db *DB) GetSchema(table string) (Schema, error) {
 
 // it translates a list of requested string coloumn names into their physical integer indicies based on the schema def.
 func lookupColumns(cols []Column, names []string) ([]int, error) {
- indices := make([]int, len(names))
+	indices := make([]int, len(names))
 
- for i, name := range names {
-	found := false
-	for j, col := range cols {
-		if col.Name == name {
-			indices[i] = j 
-			found = true
-			break
+	for i, name := range names {
+		found := false
+		for j, col := range cols {
+			if col.Name == name {
+				indices[i] = j
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, errors.New("column not found: " + name)
 		}
 	}
-	if !found {
-		return nil, errors.New("column not found: " + name)
-	}
- }
- return indices, nil
+	return indices, nil
 }
 
 func makePKey(schema *Schema, pkey []NamedCell) (Row, error) {
@@ -172,10 +214,10 @@ func makePKey(schema *Schema, pkey []NamedCell) (Row, error) {
 func makeRow(schema *Schema, names []string, vals []Cell) (Row, error) {
 	row := schema.NewRow()
 	for i, name := range names {
-		idx := -1 
+		idx := -1
 		for j, col := range schema.Cols {
 			if col.Name == name {
-				idx = j 
+				idx = j
 				break
 			}
 		}
@@ -198,7 +240,6 @@ func subsetRow(row Row, indices []int) (out Row) {
 	return
 }
 
-
 // fillNonPKey safely updates a row's values while strictly preventing mutations to primary keys.
 func fillNonPKey(schema *Schema, updates []NamedCell, out Row) error {
 	for _, expr := range updates {
@@ -216,7 +257,7 @@ func fillNonPKey(schema *Schema, updates []NamedCell, out Row) error {
 	return nil
 }
 
-// DDL: Data Definition Language. 
+// DDL: Data Definition Language.
 // It defines the physical rules of the database.
 func (db *DB) execCreateTable(stmt *StmtCreateTable) (err error) {
 	// 0. Check if already exists.
@@ -229,12 +270,12 @@ func (db *DB) execCreateTable(stmt *StmtCreateTable) (err error) {
 		Table: stmt.table,
 		Cols:  stmt.cols,
 	}
-	
+
 	// 2. Translate string-based pk into integer indicies.
 	if schema.PKey, err = lookupColumns(stmt.cols, stmt.pkey); err != nil {
 		return err
 	}
-	
+
 	// 2. The JSON Serialization.
 	// Convert the Go struct into raw bytes for the KV store.
 	val, err := json.Marshal(schema)
@@ -244,7 +285,7 @@ func (db *DB) execCreateTable(stmt *StmtCreateTable) (err error) {
 
 	// 3. Durable Write.
 	// Prefix the key so the storage engine knows this is metadata, not user data.
-	_, err = db.KV.Set([]byte("@schema_" + schema.Table), val)
+	_, err = db.KV.Set([]byte("@schema_"+schema.Table), val)
 	if err != nil {
 		return err
 	}
@@ -252,13 +293,13 @@ func (db *DB) execCreateTable(stmt *StmtCreateTable) (err error) {
 	// 4. The Cache Population.
 	// Make the schema instantly available in RAM for future queries.
 	db.tables[schema.Table] = schema
-	
+
 	return nil
 }
 
-// DQL (Data Query Language) pipeline. 
+// DQL (Data Query Language) pipeline.
 // Its job is to act as the ultimate translator between the user's abstract SQL string
-// and the physical hardware of the storage engine. 
+// and the physical hardware of the storage engine.
 func (db *DB) execSelect(stmt *StmtSelect) ([]Row, error) {
 	// 1. Fetch the metadata (Checks RAM first, then Disk).
 	schema, err := db.GetSchema(stmt.table)
@@ -420,7 +461,7 @@ func (db *DB) ExecStmt(stmt interface{}) (r SQLResult, err error) {
 		err = db.execCreateTable(ptr)
 
 	case *StmtSelect:
-		r.Header = ptr.cols 
+		r.Header = ptr.cols
 		r.Values, err = db.execSelect(ptr)
 
 	case *StmtInsert:
@@ -441,4 +482,32 @@ func (db *DB) ExecStmt(stmt interface{}) (r SQLResult, err error) {
 func (db *DB) Delete(schema *Schema, row Row) (deleted bool, err error) {
 	key := row.EncodeKey(schema)
 	return db.KV.Del(key)
+}
+
+func (db *DB) Range(schema *Schema, req *RangeReq) (*RowIterator, error) {
+	start := EncodeKeyPrefix(schema, req.Start, suffixPositive(req.StartCmp))
+	stop := EncodeKeyPrefix(schema, req.Stop, suffixPositive(req.StopCmp))
+	desc := isDescending(req.StartCmp)
+	kvIter, err := db.KV.Range(start, stop, desc)
+	if err != nil {
+		return nil, err
+	}
+
+	iter := &RowIterator{
+		schema: schema,
+		iter:   kvIter,
+		row:    schema.NewRow(),
+	}
+
+	iter.valid, err = decodeKVIter(
+		schema,
+		kvIter,
+		iter.row,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return iter, nil
 }

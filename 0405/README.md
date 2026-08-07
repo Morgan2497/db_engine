@@ -346,117 +346,258 @@ must exclude every key beginning with `(123, 4)`. Its full-tuple boundary behave
 
 ---
 
-## 7. Converting Prefix Comparisons to Full-Key Bounds
+## 7. Why Prefix Ranges Need Infinity
 
-This section explains how a partial comparison becomes a comparison between complete keys.
+Consider:
 
-Assume the primary key contains three columns:
-
-```text
-(a, b, c)
+```sql
+department <= "Sales"
 ```
 
-A complete key might be:
+This should include every Sales employee:
 
 ```text
-(1, 2, 5)
+("Engineering", 1)
+("Engineering", 2)
+("Sales", 1)
+("Sales", 5)
+("Sales", 9)
 ```
 
-The expression `(1, 2)` is a prefix. It means:
+But the query only specifies the first primary-key column. It does not provide
+`employee_id`.
+
+The database turns the incomplete boundary into:
 
 ```text
-a = 1
-b = 2
-c = anything
+("Sales", +∞)
 ```
 
-Therefore, all of these keys belong to the `(1, 2)` prefix group:
+Every real Sales key sorts before that boundary:
 
 ```text
-(1, 2, 1)
-(1, 2, 5)
-(1, 2, 100)
+("Sales", 1) < ("Sales", +∞)
+("Sales", 5) < ("Sales", +∞)
+("Sales", 9) < ("Sales", +∞)
 ```
 
-Composite keys are compared from left to right: compare `a` first, then `b` if `a` is equal, then `c` if both earlier values are equal.
+Therefore, all Sales rows are included.
 
-### The meaning of `-∞` and `+∞`
+For a strict comparison:
 
-These are not real database values. They are boundary markers for the prefix group:
+```sql
+department < "Sales"
+```
+
+No Sales row should be included, so the boundary becomes:
 
 ```text
-(1, 2, -∞)  ← immediately before the group
-(1, 2, 1)
-(1, 2, 5)
-(1, 2, 100)
-(1, 2, +∞)  ← immediately after the group
+("Sales", -∞)
 ```
 
-In plain language:
-
-- `(1, 2, -∞)` means the beginning of the `(1, 2, ...)` group.
-- `(1, 2, +∞)` means the end of the `(1, 2, ...)` group.
-
-### 1. Strict upper bound: `<`
+Every real Sales key sorts after that boundary:
 
 ```text
-Prefix expression:  (a, b) < (1, 2)
-Full-key form:      (a, b, c) <= (1, 2, -∞)
+("Sales", -∞) < ("Sales", 1)
+("Sales", -∞) < ("Sales", 5)
+("Sales", -∞) < ("Sales", 9)
 ```
 
-The query must exclude every key beginning with `(1, 2)`. Because every real `c` is greater than `-∞`, real keys such as `(1, 2, 1)` and `(1, 2, 100)` fail the `<= (1, 2, -∞)` check.
+Consequently, stopping at `("Sales", -∞)` stops immediately before the Sales
+group.
 
-The boundary stops immediately before the `(1, 2, ...)` group.
+### The four rules
 
-### 2. Inclusive upper bound: `<=`
+For an upper bound:
 
 ```text
-Prefix expression:  (a, b) <= (1, 2)
-Full-key form:      (a, b, c) <= (1, 2, +∞)
+<  prefix  → prefix + -∞
+<= prefix  → prefix + +∞
 ```
 
-The query must include every key beginning with `(1, 2)`. Because every real `c` is less than `+∞`, keys such as `(1, 2, 1)`, `(1, 2, 5)`, and `(1, 2, 100)` all pass the upper-bound check.
-
-The `+∞` boundary is placed after the entire group.
-
-### 3. Strict lower bound: `>`
+For a lower bound:
 
 ```text
-Prefix expression:  (a, b) > (1, 2)
-Full-key form:      (a, b, c) >= (1, 2, +∞)
+>= prefix  → prefix + -∞
+>  prefix  → prefix + +∞
 ```
 
-The query must skip every key beginning with `(1, 2)`. Every real key in that group is less than `(1, 2, +∞)`, so it fails the lower-bound check. The scan begins only after the entire `(1, 2, ...)` group.
+Or as a table:
 
-### 4. Inclusive lower bound: `>=`
-
-```text
-Prefix expression:  (a, b) >= (1, 2)
-Full-key form:      (a, b, c) >= (1, 2, -∞)
-```
-
-The query must include every key beginning with `(1, 2)`. Every real key in that group is greater than `(1, 2, -∞)`, so it passes the lower-bound check. The scan begins at the start of the `(1, 2, ...)` group.
-
-### The rule to remember
-
-```text
-Upper bound:
-    <   → -∞  (stop before the group)
-    <=  → +∞  (include the entire group)
-
-Lower bound:
-    >=  → -∞  (start at the group)
-    >   → +∞  (start after the group)
-```
-
-The complete mapping is:
-
-| Prefix condition | Equivalent full-key boundary | Synthetic suffix |
+| Condition | Synthetic boundary | Reason |
 |---|---|---|
-| `(a,b) < (1,2)` | `(a,b,c) <= (1,2,-∞)` | `-∞` |
-| `(a,b) <= (1,2)` | `(a,b,c) <= (1,2,+∞)` | `+∞` |
-| `(a,b) > (1,2)` | `(a,b,c) >= (1,2,+∞)` | `+∞` |
-| `(a,b) >= (1,2)` | `(a,b,c) >= (1,2,-∞)` | `-∞` |
+| `< Sales` | `(Sales, -∞)` | Stop before all Sales rows |
+| `<= Sales` | `(Sales, +∞)` | Stop after all Sales rows |
+| `>= Sales` | `(Sales, -∞)` | Start before all Sales rows |
+| `> Sales` | `(Sales, +∞)` | Start after all Sales rows |
+
+A useful mental shortcut:
+
+```text
+-∞ = beginning of the matching prefix group
++∞ = end of the matching prefix group
+```
+
+Then ask whether the scan should begin or end before or after that group.
+
+### Example 1: A normal numeric range
+
+Suppose the stored primary keys are:
+
+```text
+10, 20, 30, 40, 50
+```
+
+And the query is:
+
+```sql
+WHERE id >= 20 AND id < 40
+```
+
+#### Lower bound: `id >= 20`
+
+Because equality should be included, construct:
+
+```text
+(20, -∞)
+```
+
+Conceptually:
+
+```text
+(20, -∞) < stored key 20
+```
+
+Seeking to the first key at or after that boundary lands on `20`.
+
+#### Upper bound: `id < 40`
+
+Because equality should be excluded, construct:
+
+```text
+(40, -∞)
+```
+
+Conceptually:
+
+```text
+(40, -∞) < stored key 40
+```
+
+The range iterator accepts keys up through the synthetic stop boundary. When
+it reaches the real key `40`, that key is already greater than `(40, -∞)`, so
+iteration stops.
+
+Result:
+
+```text
+20, 30
+```
+
+### Example 2: Changing strictness
+
+Now consider:
+
+```sql
+WHERE id > 20 AND id <= 40
+```
+
+The boundaries become:
+
+```text
+start = (20, +∞)
+stop  = (40, +∞)
+```
+
+The ordering around those keys is conceptually:
+
+```text
+stored 20 < (20, +∞)
+stored 40 < (40, +∞)
+```
+
+Therefore:
+
+- seeking at or after `(20, +∞)` skips `20`;
+- the real `40` is still before `(40, +∞)`, so it is included.
+
+Result:
+
+```text
+30, 40
+```
+
+Here are all four variants:
+
+| Query | Encoded start | Encoded stop | Result |
+|---|---|---|---|
+| `id >= 20 AND id <= 40` | `(20, -∞)` | `(40, +∞)` | `20, 30, 40` |
+| `id > 20 AND id <= 40` | `(20, +∞)` | `(40, +∞)` | `30, 40` |
+| `id >= 20 AND id < 40` | `(20, -∞)` | `(40, -∞)` | `20, 30` |
+| `id > 20 AND id < 40` | `(20, +∞)` | `(40, -∞)` | `30` |
+
+Although these look like two-element tuples, with a complete primary key the
+“infinity” is effectively positioned immediately before or after that exact
+key.
+
+### Example 3: The composite-key case
+
+Suppose the stored keys are:
+
+```text
+("Engineering", 1)
+("Sales", 1)
+("Sales", 5)
+("Sales", 9)
+("Support", 1)
+```
+
+The query is:
+
+```sql
+WHERE department >= "Sales"
+  AND department <= "Sales"
+```
+
+This is essentially “give me every employee in Sales.”
+
+The lower boundary is:
+
+```text
+("Sales", -∞)
+```
+
+The upper boundary is:
+
+```text
+("Sales", +∞)
+```
+
+So the complete ordering looks like:
+
+```text
+("Engineering", 1)
+
+("Sales", -∞)       ← range begins
+("Sales", 1)
+("Sales", 5)
+("Sales", 9)
+("Sales", +∞)       ← range ends
+
+("Support", 1)
+```
+
+Result:
+
+```text
+("Sales", 1)
+("Sales", 5)
+("Sales", 9)
+```
+
+This is where infinity is especially valuable: the engine can select an
+entire composite-key prefix without knowing the minimum or maximum possible
+`employee_id`.
 
 ---
 

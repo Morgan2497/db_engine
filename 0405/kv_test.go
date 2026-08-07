@@ -218,3 +218,144 @@ func TestKVSeek(t *testing.T) {
 	require.Nil(t, err)
 	assert.False(t, iter.Valid())
 }
+
+func TestKVRangedAscending(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "range-ascending.log")
+
+	kv := &KV{
+		log: Log{FileName: path},
+	}
+
+	require.NoError(t, kv.Open())
+	defer kv.Close()
+
+	// Physical keys stored in sorted order by KV.Set.
+	keys := []string{"10", "20", "30", "40", "50"}
+	t.Logf("[SETUP] inserting keys: %v", keys)
+
+	for _, key := range keys {
+		_, err := kv.Set([]byte(key), []byte("value-"+key))
+		require.NoError(t, err)
+		t.Logf("[INSERT] key=%q value=%q", key, "value-"+key)
+	}
+
+	// Seek starts at the first key >= "25", which is "30".
+	// "40" is the inclusive stop key.
+	t.Log(`[RANGE] request: start="25" stop="40" direction=ascending`)
+	iter, err := kv.Range(
+		[]byte("25"),
+		[]byte("40"),
+		false,
+	)
+	require.NoError(t, err)
+	require.True(t, iter.Valid())
+	t.Logf(
+		"[SEEK] initial position=%d current key=%q (first key >= start)",
+		iter.iter.pos,
+		iter.Key(),
+	)
+
+	var got []string
+	step := 1
+
+	for iter.Valid() {
+		t.Logf(
+			"[STEP %d] valid=true position=%d key=%q value=%q stop=%q",
+			step,
+			iter.iter.pos,
+			iter.Key(),
+			iter.Val(),
+			iter.stop,
+		)
+		got = append(got, string(iter.Key()))
+
+		oldPos := iter.iter.pos
+		require.NoError(t, iter.Next())
+		t.Logf("[MOVE %d] ascending Next(): position %d -> %d", step, oldPos, iter.iter.pos)
+		step++
+	}
+
+	if iter.iter.Valid() {
+		t.Logf(
+			"[STOP] physical position=%d still exists, but key=%q is greater than stop=%q",
+			iter.iter.pos,
+			iter.iter.Key(),
+			iter.stop,
+		)
+	} else {
+		t.Logf("[STOP] physical iterator position=%d is outside the KV store", iter.iter.pos)
+	}
+
+	t.Logf("[RESULT] collected keys: %v", got)
+	assert.Equal(t, []string{"30", "40"}, got)
+}
+
+func TestKVRangedDescending(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "range-descending.log")
+
+	kv := &KV{
+		log: Log{FileName: path},
+	}
+
+	require.NoError(t, kv.Open())
+	defer kv.Close()
+
+	keys := []string{"10", "20", "30", "40", "50"}
+	t.Logf("[SETUP] inserting keys: %v", keys)
+
+	for _, key := range keys {
+		_, err := kv.Set([]byte(key), []byte("value-"+key))
+		require.NoError(t, err)
+		t.Logf("[INSERT] key=%q value=%q", key, "value-"+key)
+	}
+
+	// Seek("45") initially lands on "50" because Seek finds the first key >= start.
+	// Range corrects that position to "40", the first key <= start.
+	t.Log(`[RANGE] request: start="45" stop="20" direction=descending`)
+	iter, err := kv.Range(
+		[]byte("45"),
+		[]byte("20"),
+		true,
+	)
+	require.NoError(t, err)
+	require.True(t, iter.Valid())
+	t.Logf(
+		"[SEEK + CORRECTION] initial position=%d current key=%q (first key <= start)",
+		iter.iter.pos,
+		iter.Key(),
+	)
+
+	var got []string
+	step := 1
+
+	for iter.Valid() {
+		t.Logf(
+			"[STEP %d] valid=true position=%d key=%q value=%q stop=%q",
+			step,
+			iter.iter.pos,
+			iter.Key(),
+			iter.Val(),
+			iter.stop,
+		)
+		got = append(got, string(iter.Key()))
+
+		oldPos := iter.iter.pos
+		require.NoError(t, iter.Next())
+		t.Logf("[MOVE %d] descending Prev(): position %d -> %d", step, oldPos, iter.iter.pos)
+		step++
+	}
+
+	if iter.iter.Valid() {
+		t.Logf(
+			"[STOP] physical position=%d still exists, but key=%q is less than stop=%q",
+			iter.iter.pos,
+			iter.iter.Key(),
+			iter.stop,
+		)
+	} else {
+		t.Logf("[STOP] physical iterator position=%d is outside the KV store", iter.iter.pos)
+	}
+
+	t.Logf("[RESULT] collected keys: %v", got)
+	assert.Equal(t, []string{"40", "30", "20"}, got)
+}

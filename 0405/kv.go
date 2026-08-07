@@ -6,14 +6,14 @@ import (
 )
 
 /*
-* mem map[string][]byte is replaced. 
+* mem map[string][]byte is replaced.
 * map is fundamentally a hash table, and hash tables have absolutely no order.
-* While hash table is incredibly fast for singly-row lookups, it physcially 
+* While hash table is incredibly fast for singly-row lookups, it physcially
 * scatters data randomly in memory based on a hashing algorithm.
-*/
+ */
 
 type KV struct {
-	log Log
+	log  Log
 	keys [][]byte
 	vals [][]byte
 }
@@ -21,16 +21,16 @@ type KV struct {
 type KVIterator struct {
 	keys [][]byte
 	vals [][]byte
-	pos int
+	pos  int
 }
 
 // The disk log is "append-only", it contains a messy history of every action ever taken.
 // If a user created a post, updated it twice, and then deleted it, te log contains four
 // separate entries for that one key. Open() cleans this up. It reads all entries into memeory,
 // groups them together by sorting them lexicographically and then iterates through them to
-// resolve the final state. 
+// resolve the final state.
 func (kv *KV) Open() error {
-	// 0. Attempts to open the physical disk log. 
+	// 0. Attempts to open the physical disk log.
 	if err := kv.log.Open(); err != nil {
 		return err
 	}
@@ -85,11 +85,11 @@ func BinarySearchFunc[S ~[]E, E, T any](x S, target T, cmp func(E, T) int) (pos 
 	// 1. Define the search boundaries.
 	low := 0
 	high := len(x)
-	
+
 	// 2. Binary search.
 	for low < high {
-		mid := low + (high - low) / 2
-		
+		mid := low + (high-low)/2
+
 		if cmp(x[mid], target) < 0 {
 			low = mid + 1
 		} else {
@@ -99,9 +99,10 @@ func BinarySearchFunc[S ~[]E, E, T any](x S, target T, cmp func(E, T) int) (pos 
 	if low < len(x) && cmp(x[low], target) == 0 {
 		return low, true
 	}
-	// Target not found. 
+	// Target not found.
 	return low, false
 }
+
 // Get retrieves a value. Returns false if the key does not exist.
 // why does the public API accept a byte slice ([]byte) if our internal map uses a string?
 // It treats everything as raw binary data. If our API forced to pass strings, they would have to constantly convert their binary payloads
@@ -141,16 +142,16 @@ func (kv *KV) SetEx(key []byte, val []byte, mode UpdateMode) (updated bool, err 
 	if updated {
 		// This append-only log step is cruciall for crash recovery. If the server loses power,
 		// the data is not lost as the engine will simply read the log during the next Open()
-		// to reconstruct the state. 
+		// to reconstruct the state.
 		if err = kv.log.Write(&Entry{key: key, val: val}); err != nil {
 			return false, err
-		} 
+		}
 		if exist { // If the key already exists so for either upsert or update.
 			kv.vals[idx] = val
 		} else { // If the key does not exist, it is a new upcoming data, so insert.
-				kv.keys = slices.Insert(kv.keys, idx, key)
-				kv.vals = slices.Insert(kv.vals, idx, val)
-			}	
+			kv.keys = slices.Insert(kv.keys, idx, key)
+			kv.vals = slices.Insert(kv.vals, idx, val)
+		}
 	}
 	return
 }
@@ -191,9 +192,9 @@ func (iter *KVIterator) Valid() bool {
 	return 0 <= iter.pos && iter.pos < len(iter.keys)
 }
 
-func (iter *KVIterator) Key() []byte {return iter.keys[iter.pos]}
+func (iter *KVIterator) Key() []byte { return iter.keys[iter.pos] }
 
-func (iter *KVIterator) Val() []byte {return iter.vals[iter.pos]}
+func (iter *KVIterator) Val() []byte { return iter.vals[iter.pos] }
 
 // Positions -1 and len(keys) means out of range. With this design,
 // moving one step back when out of range can return to range.
@@ -211,3 +212,76 @@ func (iter *KVIterator) Next() error {
 	return nil
 }
 
+type RangedKVIter struct {
+	iter KVIterator
+	stop []byte
+	desc bool
+}
+
+func (iter *RangedKVIter) Key() []byte {
+	return iter.iter.Key()
+}
+
+func (iter *RangedKVIter) Val() []byte {
+	return iter.iter.Val()
+}
+
+func (iter *RangedKVIter) Valid() bool {
+	if !iter.iter.Valid() {
+		return false
+	}
+
+	r := bytes.Compare(iter.iter.Key(), iter.stop)
+	if iter.desc && r < 0 {
+		return false
+	} else if !iter.desc && r > 0 {
+		return false
+	}
+	return true
+}
+
+func (iter *RangedKVIter) Next() error {
+	if !iter.Valid() {
+		return nil
+	}
+
+	if iter.desc {
+		return iter.iter.Prev()
+	} else {
+		return iter.iter.Next()
+	}
+}
+
+func (kv *KV) Range(start, stop []byte, desc bool) (*RangedKVIter, error) {
+	iter, err := kv.Seek(start)
+	if err != nil {
+		return nil, err
+	}
+
+	// Seek finds the first key >= start.
+	// A descending scan needs the first key <= start.
+	if desc {
+		seekWhenPastEnd := !iter.Valid()
+		seekLandedAboveStart := false
+
+		// Key() is only safe when the iterator is valid.
+		if !seekWhenPastEnd {
+			seekLandedAboveStart = bytes.Compare(iter.Key(), start) > 0
+		}
+
+		needTMoveBackWard := seekWhenPastEnd || seekLandedAboveStart
+
+		if needTMoveBackWard {
+			if err := iter.Prev(); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return &RangedKVIter{
+		iter: *iter,
+		stop: stop,
+		desc: desc,
+	}, nil
+
+}
