@@ -440,6 +440,81 @@ A useful mental shortcut:
 
 Then ask whether the scan should begin or end before or after that group.
 
+### How to read infinity in a lower bound
+
+It is easy to misread `(20, -∞)` as “20 and everything below it.” That is not
+what it means. The infinity marker does not change the value `20`; it only
+places a boundary within the group of keys whose first component is exactly
+`20`.
+
+Keys are compared from left to right. The database compares `id` first and
+only looks at the synthetic suffix when the IDs are equal. The conceptual
+ordering is:
+
+```text
+(19, stored suffix)
+
+(20, -∞)              ← immediately before the ID 20 group
+(20, stored suffix)   ← the real stored key 20
+(20, +∞)              ← immediately after the ID 20 group
+
+(21, stored suffix)
+```
+
+Every key whose ID is below `20` remains before the start boundary. For
+example:
+
+```text
+(19, +∞) < (20, -∞)
+```
+
+This is true because `19 < 20`; the suffixes never need to be compared. Thus,
+starting at `(20, -∞)` does not include `19` or any smaller ID. It starts just
+before the real key `20` and then moves forward.
+
+For an inclusive lower bound:
+
+```sql
+WHERE id >= 20
+```
+
+the scan must include `20`, so its starting position is immediately before
+the ID 20 group:
+
+```text
+start = (20, -∞)
+
+(19, stored)   (20, -∞)   (20, stored)   (21, stored)
+                   start └──────────────────────────→
+
+result: 20, 21, ...
+```
+
+For a strict lower bound:
+
+```sql
+WHERE id > 20
+```
+
+the scan must skip `20`, so its starting position is immediately after the ID
+20 group:
+
+```text
+start = (20, +∞)
+
+(20, stored)   (20, +∞)   (21, stored)   (22, stored)
+                   start └──────────────────────────→
+
+result: 21, 22, ...
+```
+
+For lower bounds, the shortcut is therefore:
+
+```text
+>= value → begin immediately before the matching group → (value, -∞)
+>  value → begin immediately after the matching group  → (value, +∞)
+```
+
 ### Example 1: A normal numeric range
 
 Suppose the stored primary keys are:
@@ -465,10 +540,11 @@ Because equality should be included, construct:
 Conceptually:
 
 ```text
-(20, -∞) < stored key 20
+(19, stored) < (20, -∞) < stored key 20 < (20, +∞)
 ```
 
-Seeking to the first key at or after that boundary lands on `20`.
+Seeking to the first key at or after `(20, -∞)` lands on `20`. Keys below
+`20` are not included because they sort before the start boundary.
 
 #### Upper bound: `id < 40`
 
