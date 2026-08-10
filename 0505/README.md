@@ -618,9 +618,9 @@ SELECT and UPDATE decide what to do with the value
 
 ---
 
-## 10. SELECT Headers Need Special Attention
+## 10. SELECT Headers
 
-The current result type stores headers as strings:
+Before 0505, the result type stores headers as strings:
 
 ```go
 type SQLResult struct {
@@ -640,7 +640,25 @@ because `stmt.cols` is `[]string`.
 After `stmt.cols` becomes `[]interface{}`, that assignment no longer compiles.
 An expression tree cannot be directly assigned to a string slice.
 
-Eventually the engine needs a policy for expression labels:
+This chapter does not add an expression-to-SQL formatter. The minimal matching
+change is therefore:
+
+```go
+type SQLResult struct {
+    Header []interface{}
+    // ...
+}
+```
+
+This lets `ExecStmt()` continue to assign the parsed SELECT list directly:
+
+```go
+r.Header = ptr.cols
+```
+
+A simple column header remains the string `"a"`; a calculated-column header is
+the corresponding expression-tree node. A later presentation layer could
+format those trees into labels such as:
 
 ```text
 expression       possible result header
@@ -649,10 +667,8 @@ a + b            a + b
 a * 4 - b        a * 4 - b
 ```
 
-The chapter's main concern is expression parsing and evaluation, so header
-formatting is a small integration detail. Preserve `Header` as `[]string` and
-convert each selected expression into an appropriate display label instead of
-changing the public result header to `[]interface{}`.
+Human-readable formatting is separate from the parsing and evaluation work in
+this chapter.
 
 ---
 
@@ -927,17 +943,17 @@ The shortest summary is:
 
 ## Chapter Completion Checklist
 
-- [ ] `StmtSelect.cols` stores expression nodes.
-- [ ] `parseSelect()` parses each selected item with `parseExpr()`.
-- [ ] `ExprAssign` stores a destination column and an expression tree.
-- [ ] `StmtUpdate.value` stores `ExprAssign` values.
-- [ ] `parseAssign()` parses `column = expression`.
-- [ ] `parseUpdate()` uses `parseAssign()`.
-- [ ] `execSelect()` evaluates every selected expression.
-- [ ] `execUpdate()` evaluates every assignment against the original row.
-- [ ] UPDATE results are applied only after all expressions are evaluated.
-- [ ] SELECT headers remain valid strings.
-- [ ] Parser tests show the expression-tree structure.
-- [ ] Execution tests log input rows, evaluation, and final results.
-- [ ] Existing INSERT, DELETE, and WHERE behavior still passes its tests.
-- [ ] `gofmt` and `go test -v ./0505` pass.
+- [x] `StmtSelect.cols` stores expression nodes.
+- [x] `parseSelect()` parses each selected item with `parseExpr()`.
+- [x] `ExprAssign` stores a destination column and an expression tree.
+- [x] `StmtUpdate.value` stores `ExprAssign` values.
+- [x] `parseAssign()` parses `column = expression`.
+- [x] `parseUpdate()` uses `parseAssign()`.
+- [x] `execSelect()` evaluates every selected expression.
+- [x] `execUpdate()` evaluates every assignment against the original row.
+- [x] UPDATE results are applied only after all expressions are evaluated.
+- [x] SELECT headers can hold parsed expression nodes.
+- [x] Parser tests show the expression-tree structure.
+- [x] Execution tests log input rows, evaluation, and final results.
+- [x] Existing INSERT, DELETE, and WHERE behavior still passes its tests.
+- [x] `gofmt` and `go test -v ./0505` pass.

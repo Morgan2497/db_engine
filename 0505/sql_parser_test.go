@@ -510,7 +510,7 @@ func TestParseSelect(t *testing.T) {
 
 	expectedOutput := StmtSelect{
 		table: "t",
-		cols:  []string{"a", "b"},
+		cols:  []interface{}{"a", "b"},
 		keys: []NamedCell{
 			{
 				column: "c",
@@ -524,4 +524,63 @@ func TestParseSelect(t *testing.T) {
 	}
 
 	testParseSelect(t, query, expectedOutput)
+}
+
+func TestParseSelectExpressions(t *testing.T) {
+	query := "SELECT a * 4 - b, d + c FROM t WHERE id=1;"
+
+	expectedOutput := StmtSelect{
+		table: "t",
+		cols: []interface{}{
+			&ExprBinOp{
+				op: OP_SUB,
+				left: &ExprBinOp{
+					op:    OP_MUL,
+					left:  "a",
+					right: &Cell{Type: TypeI64, I64: 4},
+				},
+				right: "b",
+			},
+			&ExprBinOp{op: OP_ADD, left: "d", right: "c"},
+		},
+		keys: []NamedCell{
+			{column: "id", value: Cell{Type: TypeI64, I64: 1}},
+		},
+	}
+
+	t.Logf("[SQL] %s", query)
+	t.Logf("[SELECT EXPRESSION 0]\n%s", renderExprTree(expectedOutput.cols[0]))
+	t.Logf("[SELECT EXPRESSION 1]\n%s", renderExprTree(expectedOutput.cols[1]))
+	testParseSelect(t, query, expectedOutput)
+}
+
+func TestParseUpdateExpressions(t *testing.T) {
+	query := "UPDATE t SET a = a - b, b = a, c = d + c WHERE id=1;"
+	p := NewParser(query)
+
+	stmt, err := p.parseStmt()
+	require.NoError(t, err)
+	require.True(t, p.isEnd(), "parser stopped at cursor %d", p.pos)
+
+	update, ok := stmt.(*StmtUpdate)
+	require.True(t, ok)
+
+	expected := &StmtUpdate{
+		table: "t",
+		value: []ExprAssign{
+			{column: "a", expr: &ExprBinOp{op: OP_SUB, left: "a", right: "b"}},
+			{column: "b", expr: "a"},
+			{column: "c", expr: &ExprBinOp{op: OP_ADD, left: "d", right: "c"}},
+		},
+		keys: []NamedCell{
+			{column: "id", value: Cell{Type: TypeI64, I64: 1}},
+		},
+	}
+
+	t.Logf("[SQL] %s", query)
+	for i, assignment := range update.value {
+		t.Logf("[ASSIGNMENT %d] destination=%s expression=%s", i, assignment.column, renderExprPrefix(assignment.expr))
+		t.Logf("[ASSIGNMENT %d TREE]\n%s", i, renderExprTree(assignment.expr))
+	}
+	assert.Equal(t, expected, update)
 }

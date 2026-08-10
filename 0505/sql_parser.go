@@ -15,7 +15,7 @@ type NamedCell struct {
 // StmtSelect represents a strictly formatted, single-row primary key point query.
 type StmtSelect struct {
 	table string
-	cols  []string
+	cols  []interface{} // *ExprUnOp | *ExprBinOp | string | *Cell
 	keys  []NamedCell
 }
 
@@ -39,12 +39,17 @@ type StmtInsert struct {
 type StmtUpdate struct {
 	table string
 	keys  []NamedCell
-	value []NamedCell
+	value []ExprAssign
 }
 
 type StmtDelete struct {
 	table string
 	keys  []NamedCell
+}
+
+type ExprAssign struct {
+	column string
+	expr   interface{} // *ExprUnOp | *ExprBinOp | string | *Cell
 }
 
 // NewParser initializes the lexer at the beginning of the SQL string.
@@ -285,11 +290,11 @@ func (p *Parser) parseSelect(out *StmtSelect) error {
 		if len(out.cols) > 0 && !p.tryPunctuation(",") {
 			return errors.New("expect comma")
 		}
-		if name, ok := p.tryName(); ok {
-			out.cols = append(out.cols, name)
-		} else {
-			return errors.New("expect column")
+		expression, err := p.parseExpr()
+		if err != nil {
+			return err
 		}
+		out.cols = append(out.cols, expression)
 	}
 	if len(out.cols) == 0 {
 		return errors.New("expect column list")
@@ -429,14 +434,14 @@ func (p *Parser) parseUpdate(out *StmtUpdate) error {
 		return errors.New("expect SET")
 	}
 	for !p.tryKeyword("WHERE") {
-		expr := NamedCell{}
-		if len(out.value) > 0 && !p.tryKeyword(",") {
+		assignment := ExprAssign{}
+		if len(out.value) > 0 && !p.tryPunctuation(",") {
 			return errors.New("expect ,")
 		}
-		if err := p.parseEqual(&expr); err != nil {
+		if err := p.parseAssign(&assignment); err != nil {
 			return err
 		}
-		out.value = append(out.value, expr)
+		out.value = append(out.value, assignment)
 	}
 	if len(out.value) == 0 {
 		return errors.New("expect assignment list")
@@ -475,6 +480,20 @@ func (p *Parser) parseAtom() (expr interface{}, err error) {
 		return nil, err
 	}
 	return cell, nil
+}
+
+func (p *Parser) parseAssign(out *ExprAssign) (err error) {
+	var ok bool
+	out.column, ok = p.tryName()
+
+	if !ok {
+		return errors.New("expect column")
+	}
+	if !p.tryPunctuation("=") {
+		return errors.New("expect =")
+	}
+	out.expr, err = p.parseExpr()
+	return err
 }
 
 func (p *Parser) parseAdd() (interface{}, error) {

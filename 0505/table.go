@@ -13,7 +13,7 @@ type DB struct {
 
 type SQLResult struct {
 	Updated int
-	Header  []string
+	Header  []interface{}
 	Values  []Row
 }
 
@@ -331,26 +331,28 @@ func (db *DB) execSelect(stmt *StmtSelect) ([]Row, error) {
 		return nil, err
 	}
 
-	// 2. Translate the requested return columns into integer indices.
-	indices, err := lookupColumns(schema.Cols, stmt.cols)
-	if err != nil {
-		return nil, err
-	}
-
-	// 3. Format the WHERE clause into a physical Row for the disk lookup.
+	// 2. Format the WHERE clause into a physical Row for the disk lookup.
 	row, err := makePKey(&schema, stmt.keys)
 	if err != nil {
 		return nil, err
 	}
 
-	// 4. Query the physical Key-Value store.
+	// 3. Query the physical Key-Value store and fill the complete row.
 	if ok, err := db.Select(&schema, row); err != nil || !ok {
 		return nil, err
 	}
 
-	// 5. Slice off the unrequested columns and return the result.
-	row = subsetRow(row, indices)
-	return []Row{row}, nil
+	// 4. Evaluate every selected expression against the fetched row.
+	out := make(Row, len(stmt.cols))
+	for i, expr := range stmt.cols {
+		cell, err := evalExpr(&schema, row, expr)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = *cell
+	}
+
+	return []Row{out}, nil
 }
 
 // DML: Data Manipulation Language (DML): the memory translation.
@@ -386,23 +388,44 @@ func (db *DB) execInsert(stmt *StmtInsert) (count int, err error) {
 }
 
 func (db *DB) execUpdate(stmt *StmtUpdate) (count int, err error) {
+	// 1. Get the table structure.
 	schema, err := db.GetSchema(stmt.table)
 	if err != nil {
 		return 0, err
 	}
 
+	// 2. Create a row containing the primary key from WHERE.
 	row, err := makePKey(&schema, stmt.keys)
 	if err != nil {
 		return 0, err
 	}
+
+	// 3. Fetch the complete original row.
 	if ok, err := db.Select(&schema, row); err != nil || !ok {
 		return 0, err
 	}
 
-	if err = fillNonPKey(&schema, stmt.value, row); err != nil {
+	// 4. Evaluate every assignment against the original row.
+	updates := make([]NamedCell, len(stmt.value))
+
+	for i, assignment := range stmt.value {
+		resultCell, err := evalExpr(&schema, row, assignment.expr)
+		if err != nil {
+			return 0, err
+		}
+
+		updates[i] = NamedCell{
+			column: assignment.column,
+			value:  *resultCell,
+		}
+	}
+
+	// 5. Apply the evaluated values only after all evaluation is finished.
+	if err = fillNonPKey(&schema, updates, row); err != nil {
 		return 0, err
 	}
 
+	// 6. Write the completed row back to storage.
 	updated, err := db.Update(&schema, row)
 	if err != nil {
 		return 0, err
