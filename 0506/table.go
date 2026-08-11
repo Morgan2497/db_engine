@@ -235,6 +235,52 @@ func makePKey(schema *Schema, pkey []NamedCell) (Row, error) {
 	return row, nil
 }
 
+func matchPKey(schema *Schema, cond interface{}) (Row, error) {
+  	keys, ok := matchAllEq(cond, nil)
+  	if !ok {
+  		return nil, errors.New("unimplemented WHERE")
+  	}
+
+  	return makePKey(schema, keys)
+  }
+
+func matchAllEq(cond interface{}, out []NamedCell) ([]NamedCell, bool) {
+	node, ok := cond.(*ExprBinOp)
+	if !ok {
+		return nil, false
+	}
+
+	if node.op == OP_AND {
+		var matched bool
+
+		out, matched = matchAllEq(node.left, out)
+		if !matched {
+			return nil, false
+		}
+		return matchAllEq(node.right, out)
+	}
+
+	if node.op != OP_EQ {
+		return nil, false
+	}
+
+	column, ok := node.left.(string)
+	if !ok {
+		return nil, false
+	}
+	
+	value, ok := node.right.(*Cell)
+	if !ok {
+		return nil, false
+	}
+
+	out = append(out, NamedCell {
+		column: column,
+		value: *value,
+	})
+	return out, true
+}
+
 func makeRow(schema *Schema, names []string, vals []Cell) (Row, error) {
 	row := schema.NewRow()
 	for i, name := range names {
@@ -332,7 +378,7 @@ func (db *DB) execSelect(stmt *StmtSelect) ([]Row, error) {
 	}
 
 	// 2. Format the WHERE clause into a physical Row for the disk lookup.
-	row, err := makePKey(&schema, stmt.keys)
+	row, err := matchPKey(&schema, stmt.cond)
 	if err != nil {
 		return nil, err
 	}
@@ -395,7 +441,7 @@ func (db *DB) execUpdate(stmt *StmtUpdate) (count int, err error) {
 	}
 
 	// 2. Create a row containing the primary key from WHERE.
-	row, err := makePKey(&schema, stmt.keys)
+	row, err := matchPKey(&schema, stmt.cond)
 	if err != nil {
 		return 0, err
 	}
@@ -443,7 +489,7 @@ func (db *DB) execDelete(stmt *StmtDelete) (count int, err error) {
 		return 0, err
 	}
 
-	row, err := makePKey(&schema, stmt.keys)
+	row, err := matchPKey(&schema, stmt.cond)
 	if err != nil {
 		return 0, err
 	}

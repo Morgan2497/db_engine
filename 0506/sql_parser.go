@@ -16,7 +16,26 @@ type NamedCell struct {
 type StmtSelect struct {
 	table string
 	cols  []interface{} // *ExprUnOp | *ExprBinOp | string | *Cell
-	keys  []NamedCell
+	// keys  []NamedCell
+	cond interface{}
+}
+
+type StmtInsert struct {
+	table string
+	value []Cell
+}
+
+type StmtUpdate struct {
+	table string
+	// keys  []NamedCell
+	cond  interface{}
+	value []ExprAssign
+}
+
+type StmtDelete struct {
+	table string
+	// keys  []NamedCell
+	cond interface{}
 }
 
 // Parser represents our zero-allocation string cursor.
@@ -29,22 +48,6 @@ type StmtCreateTable struct {
 	table string
 	cols  []Column
 	pkey  []string
-}
-
-type StmtInsert struct {
-	table string
-	value []Cell
-}
-
-type StmtUpdate struct {
-	table string
-	keys  []NamedCell
-	value []ExprAssign
-}
-
-type StmtDelete struct {
-	table string
-	keys  []NamedCell
 }
 
 type ExprAssign struct {
@@ -304,31 +307,29 @@ func (p *Parser) parseSelect(out *StmtSelect) error {
 	if out.table, ok = p.tryName(); !ok {
 		return errors.New("expect table name")
 	}
-	return p.parseWhere(&out.keys)
+	condition, err := p.parseWhere()
+	if err != nil {
+		return err
+	}
+
+	out.cond = condition
+	return nil
 }
 
-func (p *Parser) parseWhere(out *[]NamedCell) error {
+func (p *Parser) parseWhere() (expr interface{}, err error) {
 	if !p.tryKeyword("WHERE") {
-		return errors.New("expected keyword")
+		return nil, errors.New("expect keyword")
 	}
 
-	// If found WHERE clause.
-	for !p.tryPunctuation(";") {
-		expr := NamedCell{}
-
-		if len(*out) > 0 && !p.tryKeyword("AND") {
-			return errors.New("expect AND")
-		}
-
-		if err := p.parseEqual(&expr); err != nil {
-			return err
-		}
-		*out = append(*out, expr)
+	expr, err = p.parseExpr()
+	if err != nil {
+		return nil, err
 	}
-	if len(*out) == 0 {
-		return errors.New("expect where clause")
+
+	if !p.tryPunctuation(";") {
+		return nil, errors.New("expect ;")
 	}
-	return nil
+	return expr, nil
 }
 
 func (p *Parser) parseCommaList(item func() error) error {
@@ -433,21 +434,25 @@ func (p *Parser) parseUpdate(out *StmtUpdate) error {
 	if !p.tryKeyword("SET") {
 		return errors.New("expect SET")
 	}
-	for !p.tryKeyword("WHERE") {
+	for {
 		assignment := ExprAssign{}
-		if len(out.value) > 0 && !p.tryPunctuation(",") {
-			return errors.New("expect ,")
-		}
 		if err := p.parseAssign(&assignment); err != nil {
 			return err
 		}
 		out.value = append(out.value, assignment)
+		if !p.tryPunctuation(",") {
+			break
+		}
 	}
 	if len(out.value) == 0 {
 		return errors.New("expect assignment list")
 	}
-	p.pos -= len("WHERE")
-	return p.parseWhere(&out.keys)
+	condition, err := p.parseWhere()
+	if err != nil {
+		return err
+	}
+	out.cond = condition
+	return nil
 }
 
 func (p *Parser) parseDelete(out *StmtDelete) error {
@@ -455,7 +460,13 @@ func (p *Parser) parseDelete(out *StmtDelete) error {
 	if out.table, ok = p.tryName(); !ok {
 		return errors.New("expect table name")
 	}
-	return p.parseWhere(&out.keys)
+	
+	condition, err := p.parseWhere()
+	if err != nil {
+		return err
+	}
+	out.cond = condition
+	return nil
 }
 
 func (p *Parser) parseAtom() (expr interface{}, err error) {

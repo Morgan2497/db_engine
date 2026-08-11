@@ -511,14 +511,17 @@ func TestParseSelect(t *testing.T) {
 	expectedOutput := StmtSelect{
 		table: "t",
 		cols:  []interface{}{"a", "b"},
-		keys: []NamedCell{
-			{
-				column: "c",
-				value:  Cell{Type: TypeI64, I64: 1},
+		cond: &ExprBinOp{
+			op: OP_AND,
+			left: &ExprBinOp{
+				op:    OP_EQ,
+				left:  "c",
+				right: &Cell{Type: TypeI64, I64: 1},
 			},
-			{
-				column: "d",
-				value:  Cell{Type: TypeStr, Str: []byte("e")},
+			right: &ExprBinOp{
+				op:    OP_EQ,
+				left:  "d",
+				right: &Cell{Type: TypeStr, Str: []byte("e")},
 			},
 		},
 	}
@@ -543,8 +546,10 @@ func TestParseSelectExpressions(t *testing.T) {
 			},
 			&ExprBinOp{op: OP_ADD, left: "d", right: "c"},
 		},
-		keys: []NamedCell{
-			{column: "id", value: Cell{Type: TypeI64, I64: 1}},
+		cond: &ExprBinOp{
+			op:    OP_EQ,
+			left:  "id",
+			right: &Cell{Type: TypeI64, I64: 1},
 		},
 	}
 
@@ -572,8 +577,10 @@ func TestParseUpdateExpressions(t *testing.T) {
 			{column: "b", expr: "a"},
 			{column: "c", expr: &ExprBinOp{op: OP_ADD, left: "d", right: "c"}},
 		},
-		keys: []NamedCell{
-			{column: "id", value: Cell{Type: TypeI64, I64: 1}},
+		cond: &ExprBinOp{
+			op:    OP_EQ,
+			left:  "id",
+			right: &Cell{Type: TypeI64, I64: 1},
 		},
 	}
 
