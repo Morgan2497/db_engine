@@ -61,6 +61,60 @@ place destroys portions of the old state while constructing the new state. A
 crash during the movement can leave neither a valid old array nor a valid new
 one.
 
+### Worked insertion: where the old array is lost
+
+Start with one unused slot and a logical length of three:
+
+```text
+index:    0   1   2   3
+array:   [A] [C] [D] [_]
+length:   3
+```
+
+To insert `B` at index 1, an in-place algorithm shifts elements from right to
+left so it does not overwrite a value before moving it:
+
+```text
+initial:           [A] [C] [D] [_]
+copy D to slot 3:  [A] [C] [D] [D]
+copy C to slot 2:  [A] [C] [C] [D]
+write B to slot 1: [A] [B] [C] [D]
+```
+
+The final array is correct. But consider a power loss after copying `C`:
+
+```text
+[A] [C] [C] [D]
+         ⚡
+```
+
+This is neither complete state:
+
+```text
+old state: [A, C, D]
+new state: [A, B, C, D]
+```
+
+If the stored length is still three, the recovered logical array is
+`[A, C, C]`: `D` has been lost. If length was changed to four first, recovery
+sees `[A, C, C, D]`: `C` is duplicated and `B` is absent. Updating length in a
+different order does not make all the element moves atomic.
+
+### Worked deletion: partial shifting is also invalid
+
+Delete `B` from `[A, B, C, D]` by shifting later elements left:
+
+```text
+initial:           [A] [B] [C] [D]
+copy C to slot 1:  [A] [C] [C] [D]
+copy D to slot 2:  [A] [C] [D] [D]
+set length to 3:   [A] [C] [D]       → complete new state
+```
+
+A crash after the first copy leaves `[A, C, C, D]`, which is neither the old
+nor the new array. In-place movement uses the only valid array as workspace;
+each overwrite can destroy information required to recover the old version.
+
 The book identifies two practical families toward which the simple array can
 evolve:
 
@@ -137,6 +191,66 @@ If a crash tears the tail record, recovery ignores it and retains the earlier
 valid prefix. The checksum acts as an implicit commit boundary between usable
 and unusable records.
 
+### Worked example: a torn log append
+
+Suppose the current state is `name = "Alice"`, produced by a valid log record:
+
+```text
+record 1: [SET name | "Alice" | checksum C1]
+```
+
+The client requests `SET name = "Morgan"`. The engine appends instead of
+overwriting record 1:
+
+```text
+record 1: [SET name | "Alice"  | checksum C1]   ← old state untouched
+record 2: [SET name | "Morgan" | checksum C2]   ← new candidate
+```
+
+If record 2 is complete, recovery recomputes `C2`, accepts the record, and
+finishes with `name = "Morgan"`.
+
+Now suppose power fails while record 2 is being appended:
+
+```text
+record 1: [SET name | "Alice" | checksum C1]   ← complete
+record 2: [SET name | "Mor...                  ← torn/incomplete
+                                      ⚡
+```
+
+On restart, recovery proceeds as follows:
+
+```text
+record 1 checksum valid   → apply name = "Alice"
+record 2 checksum invalid → reject the incomplete tail and stop replay
+
+recovered state           → name = "Alice"
+```
+
+The observable result is therefore one of two complete states:
+
+```text
+append failed/tore  → name = "Alice"
+append completed    → name = "Morgan"
+```
+
+It is never `name = "Mor..."`. All three parts of the protocol matter:
+
+```text
+append without overwriting the valid prefix
+                    +
+checksum the complete proposed record
+                    +
+ignore an invalid tail during recovery
+                    =
+old state or new state, never a partial record
+```
+
+A checksum detects damage; it does not repair data by itself. This reasoning
+also assumes the expected crash damage is at the append tail. Corruption of an
+older record can be detected by its checksum, but the old value cannot be
+reconstructed from that checksum alone.
+
 The same idea appears in every method in this chapter:
 
 ```text
@@ -159,57 +273,158 @@ Different methods mainly disagree about:
 
 ## 4. Copy-on-Write (CoW)
 
-An array insert normally overwrites the array being read. Copy-on-write instead
-constructs a separate version:
+Copy-on-write means:
+
+> Do not modify the currently shared or valid object. Keep using it until a
+> different version is needed; then copy the necessary data, modify the copy,
+> and redirect the appropriate pointer to that copy.
+
+The original object remains unchanged while its replacement is being built.
+
+### The general four-step model
 
 ```text
-old file: [a, c, d]
-              │ copy and modify
-              ▼
-new file: [a, b, c, d]
+1. SHARE     Keep using the existing object.
+2. COPY      When modification is needed, copy the necessary part.
+3. MODIFY    Apply changes to the copy.
+4. REDIRECT  Point the writer or current owner to the new copy.
 ```
 
-The old version remains intact while the new version is incomplete. Only after
-the new file is complete and durable does the database replace the name that
-identifies the active file.
-
-### Protocol
+The key invariant is:
 
 ```text
-0. Initial
-
-   pointer ───────────────► [old data]
-
-1. Write a new version
-
-   pointer ───────────────► [old data]
-                             [new data, possibly incomplete]
-
-2. fsync the new version
-
-   pointer ───────────────► [old data]
-                             [complete durable new data]
-
-3. Atomically switch the pointer
-
-                             [old data]
-   pointer ───────────────► [new data]
-
-4. Delete the old version
-
-   pointer ───────────────► [new data]
+The old object is not changed while the new object is being constructed.
 ```
 
-The linearization point—the instant at which the update becomes logically
-current—is step 3, not the earlier data writes.
+In process memory, this prevents one process's private modification from
+appearing in another process. In a database, the goal is crash safety:
 
-### Using `rename()` as the switch
+> Keep the old database version valid while constructing the new version, then
+> atomically publish the complete, durable new version.
 
-On Linux, a rename that replaces the target name can serve as the atomic
-switch. After a crash, that target name resolves to the old file or the new
-file, rather than a partially updated directory entry.
+### Mock database update
 
-The ordering is essential:
+Suppose `active.db` contains an account array:
+
+```text
+active.db:
+[
+  alice = 100,
+  bob   = 200,
+  carol = 300
+]
+```
+
+The active file name behaves like a pointer:
+
+```text
+active.db ──► version 1
+              [alice=100, bob=200, carol=300]
+```
+
+Now execute:
+
+```sql
+UPDATE accounts
+SET balance = 250
+WHERE name = 'bob';
+```
+
+The desired state is:
+
+```text
+[alice=100, bob=250, carol=300]
+```
+
+#### The danger of modifying the active file
+
+If the engine overwrites `bob=200` directly, power can fail partway through
+the physical write:
+
+```text
+alice=100
+bob=2??       ← neither the complete old nor complete new value
+carol=300
+       ⚡
+```
+
+The only installed version has been damaged. CoW avoids using that installed
+version as workspace.
+
+#### Step 1: preserve and copy
+
+Leave `active.db` untouched and create a candidate file:
+
+```text
+active.db → [alice=100, bob=200, carol=300]
+new.tmp   → [alice=100, bob=200, carol=300]
+```
+
+#### Step 2: modify only the copy
+
+```text
+active.db → [alice=100, bob=200, carol=300]  ← valid published state
+new.tmp   → [alice=100, bob=250, carol=300]  ← candidate state
+```
+
+If construction of `new.tmp` fails or tears, it can be discarded. The active
+database was never overwritten.
+
+#### Step 3: persist the candidate
+
+```text
+fsync(new.tmp)
+```
+
+The new contents must become durable before anything publishes them.
+
+#### Step 4: publish with one atomic switch
+
+```text
+rename(new.tmp, active.db)
+fsync(parent directory)
+
+active.db → [alice=100, bob=250, carol=300]
+```
+
+On Linux, replacement by `rename()` can be the atomic visibility switch. The
+directory sync then makes that naming change durable.
+
+### Crash outcomes
+
+| Crash point | Active version | Recovery result |
+|---|---|---|
+| While copying or modifying `new.tmp` | Old file still active and complete | `bob = 200` |
+| After syncing `new.tmp`, before rename | Old file still active; complete candidate is unpublished | `bob = 200` |
+| After the durable name switch | New file is active and complete | `bob = 250` |
+
+Recovery therefore observes:
+
+```text
+complete old state: bob = 200
+or
+complete new state: bob = 250
+
+never a torn state: bob = 2??
+```
+
+### Formal publication protocol
+
+```text
+PRESERVE old version
+        ↓
+COPY affected data
+        ↓
+MODIFY the copy
+        ↓
+PERSIST the new version
+        ↓
+SWITCH the file name/root pointer atomically
+        ↓
+RECLAIM the old version later
+```
+
+The ordering for file replacement is essential:
 
 ```text
 write temporary/new file
@@ -218,55 +433,189 @@ fsync new file contents
         ↓
 rename over active target       ← atomic visibility switch
         ↓
-fsync parent directory          ← make the naming change durable
+fsync parent directory          ← durable metadata switch
 ```
 
-Renaming before the new contents are durable can atomically point to data that
-does not survive the crash. Atomicity of the name and durability of the file
-contents are separate requirements.
+The rename is the **linearization point**: before it, readers use the complete
+old version; after it, readers use the complete new version. Renaming first
+would risk publishing contents that have not yet survived a persistence
+barrier.
 
-### The source-name subtlety
+Atomic replacement concerns the target name. There may temporarily be both a
+source name and target name for the new data. This is harmless if the temporary
+name is not prematurely reused. Deleting obsolete files is post-commit cleanup:
+a crash may leave an extra file, but must not corrupt the selected state.
 
-Atomic replacement concerns the target name. There may be an intermediate
-state in which both the source name and target name refer to the same new data.
-That is harmless if the source name is treated as temporary and is not reused
-prematurely.
+### Cost of whole-file CoW
 
-Deleting the obsolete source is cleanup, not the commit point. A crash during
-cleanup may leak an extra file, but it must not corrupt the chosen state.
+For a flat array, copying and applying an insertion still touches `O(N)` data.
+Atomic replacement changes the crash behavior, not the algorithmic cost. A
+whole-file copy is practical only for sufficiently small data; tree CoW avoids
+copying the complete database.
 
-### Cost
+### CoW in operating systems: `fork()`
 
-For a flat array, every update copies `O(N)` data. CoW is easy to reason about,
-but a whole-file rewrite per logical update is too expensive for large data.
+Database CoW and process-memory CoW serve different goals, but share the same
+rule: **reuse unchanged data and copy only where modification would otherwise
+destroy a shared or valid old version**.
+
+Without CoW, `fork()` would need to duplicate every physical memory page for
+the child immediately:
+
+```text
+parent: [page A] [page B] [page C]
+child:  [copy A] [copy B] [copy C]
+```
+
+That would be wasteful when the child immediately calls `exec()`. `exec()`
+replaces the child's address space with a different program, so the eagerly
+copied pages would be discarded without ever being modified.
+
+With CoW, the parent and child initially have separate virtual address spaces,
+but their page-table entries refer to the same physical frames:
+
+```text
+Parent virtual P0 ──┐
+                    ├──► physical frame A, references = 2
+Child  virtual P0 ──┘
+
+Parent virtual P1 ──┐
+                    ├──► physical frame B, references = 2
+Child  virtual P1 ──┘
+
+Parent virtual P2 ──┐
+                    ├──► physical frame C, references = 2
+Child  virtual P2 ──┘
+```
+
+The mappings are marked read-only with CoW metadata. If the child immediately
+executes another program, these mappings are removed and no physical data page
+had to be copied. `fork()` still has costs such as process metadata and page
+table management; CoW avoids eagerly copying the contents of all data pages.
+
+#### What happens when the child writes?
+
+Assume both processes share frame `B`, containing `"HELLO"`, and the child
+tries to change its first byte:
+
+```text
+child P1[0] = 'Y'
+```
+
+The ordinary CPU store encounters the read-only page-table entry and raises a
+page fault. This is what it means for the kernel to “intercept” the write; it
+does not require the application to call the `write()` system call.
+
+The kernel recognizes the fault as a valid CoW write and performs these steps:
+
+```text
+1. Allocate a new physical frame B'.
+2. Copy the contents of B into B'.
+3. Change the child's page-table entry from B to B'.
+4. Mark the child's new mapping writable.
+5. Decrement B's reference count from 2 to 1.
+6. Retry the original store instruction.
+```
+
+The result is:
+
+```text
+Parent virtual P1 ──► frame B  → "HELLO"
+Child  virtual P1 ──► frame B' → "YELLO"
+```
+
+Only the modified page was copied, and the child's change is invisible to the
+parent. If a CoW page has only one reference when a process writes it, no other
+process can observe that physical frame; the kernel may simply mark it
+writable and skip the allocation and copy.
+
+#### Process CoW versus database CoW
+
+| Process memory | Database storage |
+|---|---|
+| Parent and child share unchanged physical pages | Old and new trees share unchanged nodes |
+| A written page gets a private physical copy | A changed leaf-to-root path gets copied |
+| A page-table entry selects the private page | A root pointer selects the new tree |
+| Goal: efficient private address spaces | Goal: crash-safe publication of persistent state |
+
+Memory CoW protects one process's private view from another process's writes.
+Database CoW preserves a recoverable old disk version while constructing and
+durably publishing a new version.
 
 ---
 
 ## 5. Root Pointers: Reduce a Large Update to a Small Switch
 
-The CoW pattern becomes more powerful when a data structure has a root.
+CoW does not always copy the entire database. A tree can copy only the changed
+leaf and its path to the root, while the old and new versions share every
+unchanged subtree.
 
-In a B+Tree, changing one leaf does not require copying every node. Copy the
-changed leaf and each node on the path back to the root; unchanged subtrees are
-shared:
+Suppose the active B+Tree is:
 
 ```text
-old root
-├── shared subtree A
-└── old internal node
-    ├── shared subtree B
-    └── old leaf
+                  Root R1
+                 /       \
+                /         \
+        Leaf L1             Leaf L2
+ [alice=100, bob=200]  [carol=300, zoe=400]
 
-new root
-├── shared subtree A
-└── new internal node
-    ├── shared subtree B
-    └── new leaf
+active root pointer ──► R1
 ```
 
-Once every new node is durable, atomically replacing the root pointer selects
-the complete new tree. The large logical update has been reduced to a tiny
-atomic metadata update.
+We want to change `bob = 200` to `bob = 250`. Only `L1` contains Bob.
+
+### Step 1: copy the affected leaf
+
+```text
+L1-old → [alice=100, bob=200]
+L1-new → [alice=100, bob=250]
+```
+
+The original leaf remains unchanged.
+
+### Step 2: copy the path to the root
+
+`R1` points to `L1-old`, so create `R2` pointing to `L1-new`. The unchanged
+`L2` can be shared by both tree versions:
+
+```text
+Old version:
+
+R1 ──► L1-old: [alice=100, bob=200]
+ │
+ └──► L2:      [carol=300, zoe=400]
+
+
+New version:
+
+R2 ──► L1-new: [alice=100, bob=250]
+ │
+ └──► L2:      [carol=300, zoe=400]  ← shared unchanged leaf
+```
+
+### Step 3: persist the new path
+
+```text
+write L1-new and R2
+fsync the new pages
+```
+
+### Step 4: switch the root pointer
+
+```text
+before: active root ──► R1  → bob = 200
+after:  active root ──► R2  → bob = 250
+```
+
+The root-pointer change publishes the complete tree version:
+
+```text
+crash before switch → active root is R1 → complete old tree
+crash after switch  → active root is R2 → complete new tree
+```
+
+The large logical update has therefore been reduced to one small atomic
+metadata change:
 
 ```text
 atomic data update  →  atomic root-pointer update
@@ -275,8 +624,8 @@ atomic data update  →  atomic root-pointer update
 For a whole-file representation, the active file name plays the role of a root
 pointer. For a tree, the root may be a page identifier or disk offset. If that
 identifier fits inside the hardware's atomic write unit, a single-sector write
-can perform the switch. If it cannot safely rely on such a write, the next
-method protects the pointer in software.
+can perform the switch. If the engine cannot safely rely on that property, it
+can protect the root pointer with double buffering, introduced next.
 
 ### The common pattern in three forms
 
@@ -712,6 +1061,19 @@ and the directory must be synced to make its metadata change durable.
 No. A flat array may require a full copy, but a tree can copy only the changed
 leaf-to-root path and share untouched subtrees.
 
+### “`fork()` immediately copies all of the parent's physical memory.”
+
+With CoW, parent and child initially share physical frames through separate
+page tables. A physical page is copied only when one process attempts to modify
+that shared page. A child that immediately calls `exec()` may copy none of the
+shared data pages.
+
+### “The kernel intercepts a CoW write through the `write()` syscall.”
+
+Not necessarily. An ordinary CPU store to a CoW-protected virtual page raises
+a page fault. The kernel handles that fault, creates a private writable page if
+needed, and retries the instruction.
+
 ### “Double buffering needs a separate current-slot pointer.”
 
 Not necessarily. The valid checksum determines whether a slot is usable, and
@@ -771,6 +1133,15 @@ and recovery.
 ---
 
 ## 14. Compact Mental Model
+
+An intuitive CoW analogy is:
+
+> Do not remodel the only usable house while people live inside it. Build the
+> replacement separately, make sure it is complete, move the address sign to
+> the replacement, and demolish the old house later.
+
+For a database, the “house” is a file or tree version, and the “address sign”
+is the active file name or root pointer.
 
 Remember the chapter with four verbs:
 
@@ -870,6 +1241,19 @@ One append and sync can make an update durable immediately. Many updates can
 later be flushed or merged into disk structures in a batch, avoiding multiple
 expensive direct syncs per small operation.
 
+### 14. Why does CoW make `fork()` cheaper when the child calls `exec()`?
+
+Parent and child initially share physical data pages. `exec()` discards the
+child's old mappings, so pages that neither process modified never needed to be
+copied for the child.
+
+### 15. What exactly happens when a child writes to a shared CoW page?
+
+The protected store raises a page fault. If the frame is still shared, the
+kernel allocates a new frame, copies that one page, remaps the child's virtual
+page to it as writable, decrements the old frame's reference count, and retries
+the store. The parent's mapping continues to see the original frame.
+
 ---
 
 ## Crucial Takeaways
@@ -882,6 +1266,8 @@ expensive direct syncs per small operation.
   is complete and durable.
 - Copy-on-write publishes a separate version through an atomic file-name or
   root-pointer switch.
+- In process memory, CoW lets `fork()` share unchanged physical pages; a write
+  fault privately copies only the modified page.
 - Double buffering uses two checksummed, versioned copies and needs no separate
   trusted pointer.
 - Double write protects arbitrary in-place changes with physical undo or redo
