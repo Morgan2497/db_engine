@@ -1164,6 +1164,89 @@ read exactly valueLen value bytes
 
 Simple formats often accept a few redundant bytes to reduce parsing complexity.
 
+### Three-record offset map
+
+For a second example, use three records with progressively larger keys and
+values:
+
+```text
+KV0: a   → 1
+KV1: bb  → 22
+KV2: ccc → 333
+```
+
+The metadata occupies:
+
+```text
+8-byte key count + 3 × 8-byte offsets
+= 8 + 24
+= 32 bytes
+```
+
+The record sizes are:
+
+```text
+KV0 size = 8-byte length header + 1-byte key + 1-byte value = 10
+KV1 size = 8-byte length header + 2-byte key + 2-byte value = 12
+KV2 size = 8-byte length header + 3-byte key + 3-byte value = 14
+```
+
+Therefore:
+
+```text
+bytes 0..7    nkeys = 3
+
+bytes 8..15   offset[0] = 32
+bytes 16..23  offset[1] = 42
+bytes 24..31  offset[2] = 54
+
+bytes 32..41  KV0: a → 1
+bytes 42..53  KV1: bb → 22
+bytes 54..67  KV2: ccc → 333
+```
+
+Complete tree:
+
+```text
+SSTable, 68 bytes
+│
+├── bytes 0..7: nkeys=3
+│
+├── offset table
+│   ├── bytes 8..15:  offset[0]=32 ───────────────┐
+│   ├── bytes 16..23: offset[1]=42 ───────────┐   │
+│   └── bytes 24..31: offset[2]=54 ───────┐   │   │
+│                                          │   │   │
+└── records                                │   │   │
+    ├── byte 32: KV0 ◄─────────────────────┼───┼───┘
+    │   ├── bytes 32..35: keyLen=1         │   │
+    │   ├── bytes 36..39: valLen=1         │   │
+    │   ├── byte 40:       key="a"         │   │
+    │   └── byte 41:       val="1"         │   │
+    │                                      │   │
+    ├── byte 42: KV1 ◄─────────────────────┼───┘
+    │   ├── bytes 42..45: keyLen=2         │
+    │   ├── bytes 46..49: valLen=2         │
+    │   ├── bytes 50..51: key="bb"         │
+    │   └── bytes 52..53: val="22"         │
+    │                                      │
+    └── byte 54: KV2 ◄─────────────────────┘
+        ├── bytes 54..57: keyLen=3
+        ├── bytes 58..61: valLen=3
+        ├── bytes 62..64: key="ccc"
+        └── bytes 65..67: val="333"
+```
+
+The two cursor formulas play different roles:
+
+```text
+dataOffset = 8 + 8*nkeys
+    reserves the complete offset table and starts KV0 at byte 32
+
+indexOffset = 8 + 8*writtenKeys
+    selects byte 8, 16, or 24 for the current offset entry
+```
+
 ---
 
 ## 6. Why Sorted Order Matters
