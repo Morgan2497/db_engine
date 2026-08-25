@@ -1,4 +1,4 @@
-package db0602
+package kv
 
 import (
 	"os"
