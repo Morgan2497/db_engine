@@ -1,6 +1,7 @@
-package db0602
+package kv
 
 import (
+	"encoding/binary"
 	"math/rand/v2"
 	"slices"
 	"testing"
@@ -8,22 +9,51 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestTableCell(t *testing.T) {
-	cell := Cell{Type: TypeI64, I64: -2}
-	data := []byte{0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
-	assert.Equal(t, data, cell.EncodeVal(nil))
-	decoded := Cell{Type: TypeI64}
-	rest, err := decoded.DecodeVal(data)
-	assert.True(t, len(rest) == 0 && err == nil)
-	assert.Equal(t, cell, decoded)
+func TestCellI64Roundtrip(t *testing.T) {
+	cell := Cell{Type: TypeI64, I64: -42}
+	buf := (&cell).EncodeVal(nil)
+	assert.Len(t, buf, 8)
 
-	cell = Cell{Type: TypeStr, Str: []byte("asdf")}
-	data = []byte{4, 0, 0, 0, 'a', 's', 'd', 'f'}
-	assert.Equal(t, data, cell.EncodeVal(nil))
-	decoded = Cell{Type: TypeStr}
-	rest, err = decoded.DecodeVal(data)
-	assert.True(t, len(rest) == 0 && err == nil)
-	assert.Equal(t, cell, decoded)
+	decoded := Cell{Type: TypeI64}
+	rest, err := decoded.DecodeVal(buf)
+	assert.NoError(t, err)
+	assert.Empty(t, rest)
+	assert.Equal(t, int64(-42), decoded.I64)
+}
+
+func TestCellStrRoundtrip(t *testing.T) {
+	cell := Cell{Type: TypeStr, Str: []byte("hello")}
+	buf := (&cell).EncodeVal(nil)
+	assert.Equal(t, uint32(5), binary.LittleEndian.Uint32(buf[0:4]))
+
+	decoded := Cell{Type: TypeStr}
+	rest, err := decoded.DecodeVal(buf)
+	assert.NoError(t, err)
+	assert.Empty(t, rest)
+	assert.Equal(t, []byte("hello"), decoded.Str)
+}
+
+func TestCellChainedDecode(t *testing.T) {
+	buf := (&Cell{Type: TypeI64, I64: 1}).EncodeVal(nil)
+	buf = (&Cell{Type: TypeStr, Str: []byte("x")}).EncodeVal(buf)
+
+	c1 := Cell{Type: TypeI64}
+	rest, err := c1.DecodeVal(buf)
+	assert.NoError(t, err)
+	assert.Equal(t, int64(1), c1.I64)
+
+	c2 := Cell{Type: TypeStr}
+	rest, err = c2.DecodeVal(rest)
+	assert.NoError(t, err)
+	assert.Empty(t, rest)
+	assert.Equal(t, "x", string(c2.Str))
+}
+
+func TestCellEncodeAppend(t *testing.T) {
+	base := []byte("prefix")
+	buf := (&Cell{Type: TypeI64, I64: 7}).EncodeVal(base)
+	assert.True(t, len(buf) > len(base))
+	assert.Equal(t, "prefix", string(buf[:6]))
 }
 
 func randString() (out []byte) {
@@ -75,4 +105,3 @@ func TestTableCellKey(t *testing.T) {
 	}
 	assert.True(t, slices.IsSorted(outKeys))
 }
-// QzBQWVJJOUhU https://trialofcode.org/

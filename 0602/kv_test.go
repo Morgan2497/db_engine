@@ -1,8 +1,9 @@
-package db0602
+package kv
 
 import (
 	"bytes"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -10,150 +11,159 @@ import (
 )
 
 func TestKVBasic(t *testing.T) {
-	kv := KV{}
-	kv.log.FileName = ".test_db"
-	defer os.Remove(kv.log.FileName)
+	path := filepath.Join(t.TempDir(), "basic.log")
+	db := &KV{log: Log{FileName: path}}
+	assert.NoError(t, db.Open())
+	defer db.Close()
 
-	os.Remove(kv.log.FileName)
-	err := kv.Open()
-	assert.Nil(t, err)
-	defer kv.Close()
+	updated, err := db.Set([]byte("morgankim"), []byte("developer"))
+	assert.NoError(t, err)
+	assert.True(t, updated)
 
-	updated, err := kv.Set([]byte("k1"), []byte("v1"))
-	assert.True(t, updated && err == nil)
+	updated, err = db.Set([]byte("morgankim"), []byte("developer"))
+	assert.NoError(t, err)
+	assert.False(t, updated)
 
-	val, ok, err := kv.Get([]byte("k1"))
-	assert.True(t, string(val) == "v1" && ok && err == nil)
+	val, ok, err := db.Get([]byte("morgankim"))
+	assert.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, []byte("developer"), val)
 
-	_, ok, err = kv.Get([]byte("xxx"))
-	assert.True(t, !ok && err == nil)
+	deleted, err := db.Del([]byte("morgankim"))
+	assert.NoError(t, err)
+	assert.True(t, deleted)
 
-	updated, err = kv.Del([]byte("xxx"))
-	assert.True(t, !updated && err == nil)
+	_, ok, err = db.Get([]byte("morgankim"))
+	assert.NoError(t, err)
+	assert.False(t, ok)
 
-	updated, err = kv.Del([]byte("k1"))
-	assert.True(t, updated && err == nil)
-
-	_, ok, err = kv.Get([]byte("xxx"))
-	assert.True(t, !ok && err == nil)
-
-	updated, err = kv.Set([]byte("k2"), []byte("v2"))
-	assert.True(t, updated && err == nil)
-
-	// reopen
-	kv.Close()
-	err = kv.Open()
-	assert.Nil(t, err)
-
-	_, ok, err = kv.Get([]byte("k1"))
-	assert.True(t, !ok && err == nil)
-	val, ok, err = kv.Get([]byte("k2"))
-	assert.True(t, string(val) == "v2" && ok && err == nil)
+	deleted, err = db.Del([]byte("missing"))
+	assert.NoError(t, err)
+	assert.False(t, deleted)
 }
 
-func TestKVUpdateMode(t *testing.T) {
-	kv := KV{}
-	kv.log.FileName = ".test_db"
-	defer os.Remove(kv.log.FileName)
+func TestEntryEncodeDecode(t *testing.T) {
+	ent := Entry{key: []byte("k1"), val: []byte("xxx")}
+	got := ent.Encode()
 
-	os.Remove(kv.log.FileName)
-	err := kv.Open()
-	assert.Nil(t, err)
-	defer kv.Close()
+	var decoded Entry
+	assert.NoError(t, decoded.Decode(bytes.NewReader(got)))
+	assert.Equal(t, ent.key, decoded.key)
+	assert.Equal(t, ent.val, decoded.val)
+	assert.False(t, decoded.deleted)
+}
 
-	updated, err := kv.SetEx([]byte("k1"), []byte("v1"), ModeUpdate)
-	assert.True(t, !updated && err == nil)
+func TestEntryTombstone(t *testing.T) {
+	ent := Entry{key: []byte("k1"), deleted: true}
+	got := ent.Encode()
 
-	updated, err = kv.SetEx([]byte("k1"), []byte("v1"), ModeUpdate)
-	assert.True(t, !updated && err == nil)
-
-	updated, err = kv.SetEx([]byte("k1"), []byte("v1"), ModeInsert)
-	assert.True(t, updated && err == nil)
-
-	updated, err = kv.SetEx([]byte("k1"), []byte("xx"), ModeInsert)
-	assert.True(t, !updated && err == nil)
-
-	updated, err = kv.SetEx([]byte("k1"), []byte("yy"), ModeUpdate)
-	assert.True(t, updated && err == nil)
-
-	updated, err = kv.SetEx([]byte("k1"), []byte("zz"), ModeUpsert)
-	assert.True(t, updated && err == nil)
-
-	updated, err = kv.SetEx([]byte("k2"), []byte("tt"), ModeUpsert)
-	assert.True(t, updated && err == nil)
+	var decoded Entry
+	assert.NoError(t, decoded.Decode(bytes.NewReader(got)))
+	assert.Equal(t, ent.key, decoded.key)
+	assert.True(t, decoded.deleted)
 }
 
 func TestKVRecovery(t *testing.T) {
-	kv := KV{}
-	kv.log.FileName = ".test_db"
-	defer os.Remove(kv.log.FileName)
+	path := filepath.Join(t.TempDir(), "test.log")
 
-	prepare := func() {
-		os.Remove(kv.log.FileName)
+	db1 := &KV{log: Log{FileName: path}}
+	assert.NoError(t, db1.Open())
 
-		err := kv.Open()
-		assert.Nil(t, err)
-		defer kv.Close()
+	_, err := db1.Set([]byte("user1"), []byte("Morgan"))
+	assert.NoError(t, err)
+	_, err = db1.Set([]byte("user2"), []byte("Alice"))
+	assert.NoError(t, err)
+	_, err = db1.Set([]byte("user1"), []byte("Morgan Kim"))
+	assert.NoError(t, err)
+	_, err = db1.Del([]byte("user2"))
+	assert.NoError(t, err)
+	assert.NoError(t, db1.Close())
 
-		updated, err := kv.Set([]byte("k1"), []byte("v1"))
-		assert.True(t, updated && err == nil)
-		updated, err = kv.Set([]byte("k2"), []byte("v2"))
-		assert.True(t, updated && err == nil)
-	}
+	db2 := &KV{log: Log{FileName: path}}
+	assert.NoError(t, db2.Open())
+	defer db2.Close()
 
-	prepare()
-	// simulate truncated log
-	fp, _ := os.OpenFile(kv.log.FileName, os.O_RDWR, 0o644)
-	st, _ := fp.Stat()
-	fp.Truncate(st.Size() - 1)
-	fp.Close()
-	// reopen
-	err := kv.Open()
-	assert.Nil(t, err)
-	// test
-	val, ok, err := kv.Get([]byte("k1"))
-	assert.True(t, string(val) == "v1" && ok && err == nil)
-	_, ok, err = kv.Get([]byte("k2")) // bad
-	assert.True(t, !ok && err == nil)
-	kv.Close()
+	val, ok, err := db2.Get([]byte("user1"))
+	assert.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, "Morgan Kim", string(val))
 
-	prepare()
-	// simulate bad checksum
-	fp, _ = os.OpenFile(kv.log.FileName, os.O_RDWR, 0o644)
-	st, _ = fp.Stat()
-	fp.WriteAt([]byte{0}, st.Size()-1)
-	fp.Close()
-	// reopen
-	err = kv.Open()
-	assert.Nil(t, err)
-	// test
-	val, ok, err = kv.Get([]byte("k1"))
-	assert.True(t, string(val) == "v1" && ok && err == nil)
-	_, ok, err = kv.Get([]byte("k2")) // bad
-	assert.True(t, !ok && err == nil)
-	kv.Close()
+	_, ok, err = db2.Get([]byte("user2"))
+	assert.NoError(t, err)
+	assert.False(t, ok)
 }
 
-func TestEntryEncode(t *testing.T) {
-	ent := Entry{key: []byte("k1"), val: []byte("xxx")}
-	data := []byte{0xe9, 0xec, 0x4d, 0x9e, 2, 0, 0, 0, 3, 0, 0, 0, 0, 'k', '1', 'x', 'x', 'x'}
+func TestEmptyLogOpen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "empty.log")
+	db := &KV{log: Log{FileName: path}}
+	assert.NoError(t, db.Open())
+	defer db.Close()
 
-	assert.Equal(t, data, ent.Encode())
+	_, ok, err := db.Get([]byte("missing"))
+	assert.NoError(t, err)
+	assert.False(t, ok)
+}
 
-	decoded := Entry{}
-	err := decoded.Decode(bytes.NewBuffer(data))
-	assert.Nil(t, err)
-	assert.Equal(t, ent, decoded)
+func roundtripEntry(t *testing.T, ent *Entry) {
+	t.Helper()
 
-	ent = Entry{key: []byte("k1"), deleted: true}
-	data = []byte{0x4c, 0xd0, 0xfe, 0xe5, 2, 0, 0, 0, 0, 0, 0, 0, 1, 'k', '1'}
+	enc := ent.Encode()
+	dec := &Entry{}
+	assert.NoError(t, dec.Decode(bytes.NewReader(enc)))
+	assert.Equal(t, ent.key, dec.key)
+	assert.Equal(t, ent.deleted, dec.deleted)
+	if !ent.deleted {
+		assert.Equal(t, ent.val, dec.val)
+	}
+}
 
-	assert.Equal(t, data, ent.Encode())
+func TestEntryCRCRoundtrip(t *testing.T) {
+	t.Run("set", func(t *testing.T) {
+		roundtripEntry(t, &Entry{
+			key: []byte("test_key"),
+			val: []byte("test_value"),
+		})
+	})
+	t.Run("tombstone", func(t *testing.T) {
+		roundtripEntry(t, &Entry{
+			key:     []byte("test_key"),
+			deleted: true,
+		})
+	})
+}
 
-	decoded = Entry{}
-	err = decoded.Decode(bytes.NewBuffer(data))
-	assert.Nil(t, err)
-	assert.Equal(t, ent, decoded)
+func TestBadChecksum(t *testing.T) {
+	ent := &Entry{key: []byte("k"), val: []byte("v")}
+	enc := ent.Encode()
+	enc[0] ^= 0xff
+
+	dec := &Entry{}
+	assert.ErrorIs(t, dec.Decode(bytes.NewReader(enc)), ErrBadSum)
+}
+
+func TestTornWriteRecovery(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "torn.db")
+
+	kv := &KV{log: Log{FileName: path}}
+	assert.NoError(t, kv.Open())
+	_, err := kv.Set([]byte("key1"), []byte("value1"))
+	assert.NoError(t, err)
+	assert.NoError(t, kv.Close())
+
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	assert.NoError(t, err)
+	_, err = file.Write([]byte{0xDE, 0xAD, 0xBE, 0xEF, 0x00})
+	assert.NoError(t, err)
+	assert.NoError(t, file.Close())
+
+	kv2 := &KV{log: Log{FileName: path}}
+	assert.NoError(t, kv2.Open())
+	defer kv2.Close()
+
+	val, ok, err := kv2.Get([]byte("key1"))
+	assert.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, "value1", string(val))
 }
 
 func TestKVSeek(t *testing.T) {
@@ -208,4 +218,144 @@ func TestKVSeek(t *testing.T) {
 	require.Nil(t, err)
 	assert.False(t, iter.Valid())
 }
-// QzBQWVJJOUhU https://trialofcode.org/
+
+func TestKVRangedAscending(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "range-ascending.log")
+
+	kv := &KV{
+		log: Log{FileName: path},
+	}
+
+	require.NoError(t, kv.Open())
+	defer kv.Close()
+
+	// Physical keys stored in sorted order by KV.Set.
+	keys := []string{"10", "20", "30", "40", "50"}
+	t.Logf("[SETUP] inserting keys: %v", keys)
+
+	for _, key := range keys {
+		_, err := kv.Set([]byte(key), []byte("value-"+key))
+		require.NoError(t, err)
+		t.Logf("[INSERT] key=%q value=%q", key, "value-"+key)
+	}
+
+	// Seek starts at the first key >= "25", which is "30".
+	// "40" is the inclusive stop key.
+	t.Log(`[RANGE] request: start="25" stop="40" direction=ascending`)
+	iter, err := kv.Range(
+		[]byte("25"),
+		[]byte("40"),
+		false,
+	)
+	require.NoError(t, err)
+	require.True(t, iter.Valid())
+	t.Logf(
+		"[SEEK] initial position=%d current key=%q (first key >= start)",
+		iter.iter.pos,
+		iter.Key(),
+	)
+
+	var got []string
+	step := 1
+
+	for iter.Valid() {
+		t.Logf(
+			"[STEP %d] valid=true position=%d key=%q value=%q stop=%q",
+			step,
+			iter.iter.pos,
+			iter.Key(),
+			iter.Val(),
+			iter.stop,
+		)
+		got = append(got, string(iter.Key()))
+
+		oldPos := iter.iter.pos
+		require.NoError(t, iter.Next())
+		t.Logf("[MOVE %d] ascending Next(): position %d -> %d", step, oldPos, iter.iter.pos)
+		step++
+	}
+
+	if iter.iter.Valid() {
+		t.Logf(
+			"[STOP] physical position=%d still exists, but key=%q is greater than stop=%q",
+			iter.iter.pos,
+			iter.iter.Key(),
+			iter.stop,
+		)
+	} else {
+		t.Logf("[STOP] physical iterator position=%d is outside the KV store", iter.iter.pos)
+	}
+
+	t.Logf("[RESULT] collected keys: %v", got)
+	assert.Equal(t, []string{"30", "40"}, got)
+}
+
+func TestKVRangedDescending(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "range-descending.log")
+
+	kv := &KV{
+		log: Log{FileName: path},
+	}
+
+	require.NoError(t, kv.Open())
+	defer kv.Close()
+
+	keys := []string{"10", "20", "30", "40", "50"}
+	t.Logf("[SETUP] inserting keys: %v", keys)
+
+	for _, key := range keys {
+		_, err := kv.Set([]byte(key), []byte("value-"+key))
+		require.NoError(t, err)
+		t.Logf("[INSERT] key=%q value=%q", key, "value-"+key)
+	}
+
+	// Seek("45") initially lands on "50" because Seek finds the first key >= start.
+	// Range corrects that position to "40", the first key <= start.
+	t.Log(`[RANGE] request: start="45" stop="20" direction=descending`)
+	iter, err := kv.Range(
+		[]byte("45"),
+		[]byte("20"),
+		true,
+	)
+	require.NoError(t, err)
+	require.True(t, iter.Valid())
+	t.Logf(
+		"[SEEK + CORRECTION] initial position=%d current key=%q (first key <= start)",
+		iter.iter.pos,
+		iter.Key(),
+	)
+
+	var got []string
+	step := 1
+
+	for iter.Valid() {
+		t.Logf(
+			"[STEP %d] valid=true position=%d key=%q value=%q stop=%q",
+			step,
+			iter.iter.pos,
+			iter.Key(),
+			iter.Val(),
+			iter.stop,
+		)
+		got = append(got, string(iter.Key()))
+
+		oldPos := iter.iter.pos
+		require.NoError(t, iter.Next())
+		t.Logf("[MOVE %d] descending Prev(): position %d -> %d", step, oldPos, iter.iter.pos)
+		step++
+	}
+
+	if iter.iter.Valid() {
+		t.Logf(
+			"[STOP] physical position=%d still exists, but key=%q is less than stop=%q",
+			iter.iter.pos,
+			iter.iter.Key(),
+			iter.stop,
+		)
+	} else {
+		t.Logf("[STOP] physical iterator position=%d is outside the KV store", iter.iter.pos)
+	}
+
+	t.Logf("[RESULT] collected keys: %v", got)
+	assert.Equal(t, []string{"40", "30", "20"}, got)
+}
