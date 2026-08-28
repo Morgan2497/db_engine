@@ -13,19 +13,8 @@ import (
  */
 
 type KV struct {
-	log  Log
+	log Log
 	mem SortedArray
-}
-
-type SortedArray struct {
-	keys [][]byte
-	vals [][]byte
-}
-
-type KVIterator struct {
-	keys [][]byte
-	vals [][]byte
-	pos  int
 }
 
 // The disk log is "append-only", it contains a messy history of every action ever taken.
@@ -57,18 +46,19 @@ func (kv *KV) Open() error {
 		return bytes.Compare(a.key, b.key)
 	})
 
-	// 3. Compact the data and populate the in-memory arrays.
-	kv.keys, kv.vals = kv.keys[:0], kv.vals[:0]
+	// 3. Compact the data and populate the in-memory array.
+	kv.mem.Clear()
+
 	for _, ent := range entries {
-		n := len(kv.keys)
-		// Decuplication: if the key already exits in our array, truncate the old value
-		if n > 0 && bytes.Equal(kv.keys[n-1], ent.key) {
-			kv.keys, kv.vals = kv.keys[:n-1], kv.vals[:n-1]
+		n := kv.mem.Size()
+		// Remove the previous version of a duplicate key.
+		if n > 0 && bytes.Equal(kv.mem.Key(n-1), ent.key) {
+			kv.mem.Pop()
 		}
-		// Only append if it is not a tombstone (deleted record)
+
+		// Don't add deleted records to the current in-memory state.
 		if !ent.deleted {
-			kv.keys = append(kv.keys, ent.key)
-			kv.vals = append(kv.vals, ent.val)
+			kv.mem.Push(ent.key, ent.val)
 		}
 	}
 	return nil
@@ -113,10 +103,7 @@ func BinarySearchFunc[S ~[]E, E, T any](x S, target T, cmp func(E, T) int) (pos 
 // like serialized JSON, or raw integers into strings before talking to our database.
 // So we say, "Give me raw data, I will handle the storage details."
 func (kv *KV) Get(key []byte) (val []byte, ok bool, err error) {
-	if idx, ok := slices.BinarySearchFunc(kv.keys, key, bytes.Compare); ok {
-		return kv.vals[idx], true, nil
-	}
-	return nil, false, nil
+	return kv.mem.Get(key)
 }
 
 type UpdateMode int
@@ -129,15 +116,19 @@ const (
 
 func (kv *KV) SetEx(key []byte, val []byte, mode UpdateMode) (updated bool, err error) {
 	// 1. Look up the current state.
-	idx, exist := slices.BinarySearchFunc(kv.keys, key, bytes.Compare)
+	oldVal, exist, err := kv.Get(key)
+	if err != nil {
+		return false, err
+	}
+
 	// 2. Eval. the write intent.
 	switch mode {
 	case ModeUpsert:
-		updated = !exist || !bytes.Equal(kv.vals[idx], val)
+		updated = !exist || !bytes.Equal(oldVal, val)
 	case ModeInsert:
 		updated = !exist
 	case ModeUpdate:
-		updated = exist && !bytes.Equal(kv.vals[idx], val)
+		updated = exist && !bytes.Equal(oldVal, val)
 	default:
 		panic("unreachable")
 	}
@@ -150,14 +141,11 @@ func (kv *KV) SetEx(key []byte, val []byte, mode UpdateMode) (updated bool, err 
 		if err = kv.log.Write(&Entry{key: key, val: val}); err != nil {
 			return false, err
 		}
-		if exist { // If the key already exists so for either upsert or update.
-			kv.vals[idx] = val
-		} else { // If the key does not exist, it is a new upcoming data, so insert.
-			kv.keys = slices.Insert(kv.keys, idx, key)
-			kv.vals = slices.Insert(kv.vals, idx, val)
-		}
+
+		memUpdated, memErr := kv.mem.Set(key, val)
+		check(memErr == nil && memUpdated)
 	}
-	return
+	return updated, nil
 }
 
 // Set stores a value. Reports true if the database state actually changed.
@@ -167,57 +155,28 @@ func (kv *KV) Set(key []byte, val []byte) (updated bool, err error) {
 
 // Del removes a key. Reports true if a key was actually removed.
 func (kv *KV) Del(key []byte) (deleted bool, err error) {
-	// 1. Locate the exact index of the key in the array.
-	idx, exist := slices.BinarySearchFunc(kv.keys, key, bytes.Compare)
-
-	// 2. If it does not exist, there is nothing to delete.
-	if !exist {
-		return false, nil
+	// 1. Check the current in-memory state.
+	if _, exist, getErr := kv.Get(key); getErr != nil || !exist {
+		return false, getErr
 	}
 
-	// 3. Durability First: Write the tombstone to the physical disk log.
+	// 2. Durability first: write the tombstone to the physical disk log.
 	if err = kv.log.Write(&Entry{key: key, deleted: true}); err != nil {
 		return false, err
 	}
 
-	// 4. In-Memory Deletion: Shift arrays to overwrite the deleted index.
-	kv.keys = slices.Delete(kv.keys, idx, idx+1)
-	kv.vals = slices.Delete(kv.vals, idx, idx+1)
+	// 3. Remove the key from the in-memory sorted array.
+	memDeleted, memErr := kv.mem.Del(key)
+	check(memErr == nil && memDeleted)
 	return true, nil
 }
 
-func (kv *KV) Seek(key []byte) (*KVIterator, error) {
-	// 1. Call binary search to find the first index where kv.keys[i] >= key.
-	pos, _ := slices.BinarySearchFunc(kv.keys, key, bytes.Compare)
-	return &KVIterator{keys: kv.keys, vals: kv.vals, pos: pos}, nil
-}
-
-func (iter *KVIterator) Valid() bool {
-	return 0 <= iter.pos && iter.pos < len(iter.keys)
-}
-
-func (iter *KVIterator) Key() []byte { return iter.keys[iter.pos] }
-
-func (iter *KVIterator) Val() []byte { return iter.vals[iter.pos] }
-
-// Positions -1 and len(keys) means out of range. With this design,
-// moving one step back when out of range can return to range.
-func (iter *KVIterator) Prev() error {
-	if iter.pos >= 0 {
-		iter.pos--
-	}
-	return nil
-}
-
-func (iter *KVIterator) Next() error {
-	if iter.pos < len(iter.keys) {
-		iter.pos++
-	}
-	return nil
+func (kv *KV) Seek(key []byte) (SortedKVIter, error) {
+	return kv.mem.Seek(key)
 }
 
 type RangedKVIter struct {
-	iter KVIterator
+	iter SortedKVIter
 	stop []byte
 	desc bool
 }
@@ -283,7 +242,7 @@ func (kv *KV) Range(start, stop []byte, desc bool) (*RangedKVIter, error) {
 	}
 
 	return &RangedKVIter{
-		iter: *iter,
+		iter: iter,
 		stop: stop,
 		desc: desc,
 	}, nil

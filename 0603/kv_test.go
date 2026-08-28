@@ -250,8 +250,7 @@ func TestKVRangedAscending(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, iter.Valid())
 	t.Logf(
-		"[SEEK] initial position=%d current key=%q (first key >= start)",
-		iter.iter.pos,
+		"[SEEK] current key=%q (first key >= start)",
 		iter.Key(),
 	)
 
@@ -260,30 +259,28 @@ func TestKVRangedAscending(t *testing.T) {
 
 	for iter.Valid() {
 		t.Logf(
-			"[STEP %d] valid=true position=%d key=%q value=%q stop=%q",
+			"[STEP %d] valid=true key=%q value=%q stop=%q",
 			step,
-			iter.iter.pos,
 			iter.Key(),
 			iter.Val(),
 			iter.stop,
 		)
 		got = append(got, string(iter.Key()))
 
-		oldPos := iter.iter.pos
+		oldKey := string(iter.Key())
 		require.NoError(t, iter.Next())
-		t.Logf("[MOVE %d] ascending Next(): position %d -> %d", step, oldPos, iter.iter.pos)
+		t.Logf("[MOVE %d] ascending Next() after key=%q", step, oldKey)
 		step++
 	}
 
 	if iter.iter.Valid() {
 		t.Logf(
-			"[STOP] physical position=%d still exists, but key=%q is greater than stop=%q",
-			iter.iter.pos,
+			"[STOP] physical key=%q still exists, but it is greater than stop=%q",
 			iter.iter.Key(),
 			iter.stop,
 		)
 	} else {
-		t.Logf("[STOP] physical iterator position=%d is outside the KV store", iter.iter.pos)
+		t.Log("[STOP] physical iterator is outside the KV store")
 	}
 
 	t.Logf("[RESULT] collected keys: %v", got)
@@ -320,8 +317,7 @@ func TestKVRangedDescending(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, iter.Valid())
 	t.Logf(
-		"[SEEK + CORRECTION] initial position=%d current key=%q (first key <= start)",
-		iter.iter.pos,
+		"[SEEK + CORRECTION] current key=%q (first key <= start)",
 		iter.Key(),
 	)
 
@@ -330,30 +326,28 @@ func TestKVRangedDescending(t *testing.T) {
 
 	for iter.Valid() {
 		t.Logf(
-			"[STEP %d] valid=true position=%d key=%q value=%q stop=%q",
+			"[STEP %d] valid=true key=%q value=%q stop=%q",
 			step,
-			iter.iter.pos,
 			iter.Key(),
 			iter.Val(),
 			iter.stop,
 		)
 		got = append(got, string(iter.Key()))
 
-		oldPos := iter.iter.pos
+		oldKey := string(iter.Key())
 		require.NoError(t, iter.Next())
-		t.Logf("[MOVE %d] descending Prev(): position %d -> %d", step, oldPos, iter.iter.pos)
+		t.Logf("[MOVE %d] descending Prev() after key=%q", step, oldKey)
 		step++
 	}
 
 	if iter.iter.Valid() {
 		t.Logf(
-			"[STOP] physical position=%d still exists, but key=%q is less than stop=%q",
-			iter.iter.pos,
+			"[STOP] physical key=%q still exists, but it is less than stop=%q",
 			iter.iter.Key(),
 			iter.stop,
 		)
 	} else {
-		t.Logf("[STOP] physical iterator position=%d is outside the KV store", iter.iter.pos)
+		t.Log("[STOP] physical iterator is outside the KV store")
 	}
 
 	t.Logf("[RESULT] collected keys: %v", got)
