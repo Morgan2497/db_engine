@@ -2,70 +2,77 @@ package kv
 
 import (
 	"bytes"
+	"os"
+	"path"
 	"slices"
 )
 
-/*
-* mem map[string][]byte is replaced.
-* map is fundamentally a hash table, and hash tables have absolutely no order.
-* While hash table is incredibly fast for singly-row lookups, it physcially
-* scatters data randomly in memory based on a hashing algorithm.
- */
-
 type KV struct {
-	log Log
-	mem SortedArray
-	main SortedFile
+	log  Log         // WAL: durable recent-write history.
+	mem  SortedArray // MemTale: queryable recent changes.
+	main SortedFile  // SSTable: durable older database state.
+	MultiClosers
 }
 
-// The disk log is "append-only", it contains a messy history of every action ever taken.
-// If a user created a post, updated it twice, and then deleted it, te log contains four
-// separate entries for that one key. Open() cleans this up. It reads all entries into memeory,
-// groups them together by sorting them lexicographically and then iterates through them to
-// resolve the final state.
-func (file *SortedFile) Open() error {
+func (kv *KV) Open() (err error) {
 	// 0. Attempts to open the physical disk log.
+	if err = kv.openAll(); err != nil {
+		_ = kv.Close()
+	}
+	return err
+}
+
+func (kv *KV) openAll() error {
+	if err := kv.openLog(); err != nil {
+		return err
+	}
+	return kv.openSSTable()
+}
+
+func (kv *KV) openLog() error {
 	if err := kv.log.Open(); err != nil {
 		return err
 	}
 
-	// 1. Read all historical log entries into a temporary list.
+	kv.MultiClosers = append(kv.MultiClosers, &kv.log)
+
 	entries := []Entry{}
 	for {
 		ent := Entry{}
 		eof, err := kv.log.Read(&ent)
 		if err != nil {
 			return err
-		} else if eof {
+		}
+		if eof {
 			break
 		}
 		entries = append(entries, ent)
 	}
 
-	// 2. Sort the entries by key (preserving chronological order for duplicates.)
 	slices.SortStableFunc(entries, func(a, b Entry) int {
 		return bytes.Compare(a.key, b.key)
 	})
 
-	// 3. Compact the data and populate the in-memory array.
 	kv.mem.Clear()
-
 	for _, ent := range entries {
 		n := kv.mem.Size()
-		// Remove the previous version of a duplicate key.
 		if n > 0 && bytes.Equal(kv.mem.Key(n-1), ent.key) {
 			kv.mem.Pop()
 		}
-
-		// Don't add deleted records to the current in-memory state.
-		if !ent.deleted {
-			kv.mem.Push(ent.key, ent.val)
-		}
+		kv.mem.Push(ent.key, ent.val, ent.deleted)
 	}
 	return nil
 }
 
-func (kv *KV) Close() error { return kv.log.Close() }
+func (kv *KV) openSSTable() error {
+	if kv.main.FileName != "" {
+		if err := kv.main.Open(); err != nil {
+			return err
+		}
+		kv.MultiClosers = append(kv.MultiClosers, &kv.main)
+	}
+	return nil
+}
 
 // 1. S ~[]E => Your sorted list (Haystack)
 // 2. E => The type of items IN the list.
@@ -104,7 +111,12 @@ func BinarySearchFunc[S ~[]E, E, T any](x S, target T, cmp func(E, T) int) (pos 
 // like serialized JSON, or raw integers into strings before talking to our database.
 // So we say, "Give me raw data, I will handle the storage details."
 func (kv *KV) Get(key []byte) (val []byte, ok bool, err error) {
-	return kv.mem.Get(key)
+	iter, err := kv.Seek(key)
+	ok = err == nil && iter.Valid() && bytes.Equal(iter.Key(), key)
+	if ok {
+		val = iter.Val()
+	}
+	return val, ok, err
 }
 
 type UpdateMode int
@@ -154,26 +166,44 @@ func (kv *KV) Set(key []byte, val []byte) (updated bool, err error) {
 	return kv.SetEx(key, val, ModeUpsert)
 }
 
-// Del removes a key. Reports true if a key was actually removed.
 func (kv *KV) Del(key []byte) (deleted bool, err error) {
-	// 1. Check the current in-memory state.
-	if _, exist, getErr := kv.Get(key); getErr != nil || !exist {
-		return false, getErr
+	// Check the logical database: MemTable + SSTable.
+	if _, exist, err := kv.Get(key); err != nil || !exist {
+		return false, err
 	}
 
-	// 2. Durability first: write the tombstone to the physical disk log.
+	// Make the deletion durable first.
 	if err = kv.log.Write(&Entry{key: key, deleted: true}); err != nil {
 		return false, err
 	}
 
-	// 3. Remove the key from the in-memory sorted array.
-	memDeleted, memErr := kv.mem.Del(key)
-	check(memErr == nil && memDeleted)
+	// Record the tombstone in the MemTable.
+	_, err = kv.mem.Del(key)
+	check(err == nil)
+
 	return true, nil
 }
 
 func (kv *KV) Seek(key []byte) (SortedKVIter, error) {
-	return kv.mem.Seek(key)
+	m := MergedSortedKV{&kv.mem, &kv.main}
+	iter, err := m.Seek(key)
+	if err != nil {
+		return nil, err
+	}
+	return filterDeleted(iter)
+}
+
+func filterDeleted(iter SortedKVIter) (SortedKVIter, error) {
+	for iter.Valid() && iter.Deleted() {
+		if err := iter.Next(); err != nil {
+			return nil, err
+		}
+	}
+	return NoDeletedIter{iter}, nil
+}
+
+type NoDeletedIter struct {
+	SortedKVIter // inherits all method.
 }
 
 type RangedKVIter struct {
@@ -203,7 +233,6 @@ func (iter *RangedKVIter) Valid() bool {
 	}
 	return true
 }
-
 func (iter *RangedKVIter) Next() error {
 	if !iter.Valid() {
 		return nil
@@ -211,9 +240,27 @@ func (iter *RangedKVIter) Next() error {
 
 	if iter.desc {
 		return iter.iter.Prev()
-	} else {
-		return iter.iter.Next()
 	}
+
+	return iter.iter.Next()
+}
+
+func (iter NoDeletedIter) Next() (err error) {
+	err = iter.SortedKVIter.Next()
+
+	for err == nil && iter.Valid() && iter.Deleted() {
+		err = iter.SortedKVIter.Next()
+	}
+	return err
+}
+
+func (iter NoDeletedIter) Prev() (err error) {
+	err = iter.SortedKVIter.Prev()
+
+	for err == nil && iter.Valid() && iter.Deleted() {
+		err = iter.SortedKVIter.Prev()
+	}
+	return err
 }
 
 func (kv *KV) Range(start, stop []byte, desc bool) (*RangedKVIter, error) {
@@ -248,4 +295,38 @@ func (kv *KV) Range(start, stop []byte, desc bool) (*RangedKVIter, error) {
 		desc: desc,
 	}, nil
 
+}
+
+func (kv *KV) Compact() error {
+	check(kv.main.FileName != "")
+
+	// 1. Merge MemTable and SSTable, output to a temporary file.
+	fp, err := os.CreateTemp(path.Dir(kv.main.FileName), "tmp_sstable")
+	if err != nil {
+		return err
+	}
+	filename := fp.Name()
+	_ = fp.Close()
+	defer os.Remove(filename)
+
+	file := SortedFile{FileName: filename}
+	m := MergedSortedKV{&kv.mem, &kv.main}
+	if err := file.CreateFromSorted(m); err != nil {
+		return err
+	}
+
+	// 2. Replace the original SSTable (atomic operation).
+	_ = kv.main.Close()
+	_ = file.Close()
+	if err := renameSync(file.FileName, kv.main.FileName); err != nil {
+		_ = kv.main.Open()
+		return err
+	}
+	if err = kv.main.Open(); err != nil {
+		return err
+	}
+
+	// 3. Drop the MemTable and the log.
+	kv.mem.Clear()
+	return kv.log.Truncate()
 }
