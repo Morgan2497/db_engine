@@ -36,3 +36,10 @@ func (log *Log) Read(ent *Entry) (eof bool, err error) {
 		return false, nil
 	}
 }
+
+func (log *Log) Truncate() error {
+	if _, err := log.fp.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	return log.fp.Truncate(0)
+}

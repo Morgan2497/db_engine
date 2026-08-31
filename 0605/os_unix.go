@@ -10,17 +10,17 @@ import (
 
 // syncDir forces the OS to flush the directory metadata to the physical disk.
 func syncDir(file string) error {
-	flags := os.O_RDONLY | syscall.O_DIRECTORY 
+	flags := os.O_RDONLY | syscall.O_DIRECTORY
 	dirfd, err := syscall.Open(path.Dir(file), flags, 0o644)
 	if err != nil {
-		return err 
+		return err
 	}
 	defer syscall.Close(dirfd)
 	return syscall.Fsync(dirfd)
 }
 
 func createFileSync(file string) (*os.File, error) {
-	fp, err := os.OpenFile(file, os.O_RDWR | os.O_CREATE, 0o644)
+	fp, err := os.OpenFile(file, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return nil, err
 	}
@@ -28,5 +28,12 @@ func createFileSync(file string) (*os.File, error) {
 		_ = fp.Close() // to avoid the memory leak.
 		return nil, err
 	}
-	return fp, err 
+	return fp, err
+}
+
+func renameSync(src string, dst string) error {
+	if err := os.Rename(src, dst); err != nil {
+		return err
+	}
+	return syncDir(dst)
 }
