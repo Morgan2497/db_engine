@@ -75,6 +75,47 @@ database/
 `-- sstable_42     name selected by the newest valid metadata record
 ```
 
+### Metadata files versus metadata contents
+
+The chapter's wording can be confusing here. The intended distinction is:
+
+- `kv_log`, `meta0`, and `meta1` are fixed physical filenames. The database
+  must know these names in advance so it can find the WAL and metadata when it
+  starts.
+- `KVMetaData` is not another fixed-name file. It is the value serialized
+  inside `meta0` and `meta1`.
+- `KVMetaData.SSTable` contains the dynamically generated name of the active
+  SSTable, such as `sstable_42`.
+
+For example, one of the fixed metadata files might contain the equivalent of:
+
+```json
+{
+  "Version": 42,
+  "SSTable": "sstable_42"
+}
+```
+
+Startup therefore works like this:
+
+```text
+open the known files meta0 and meta1
+                  |
+                  v
+choose the newest valid KVMetaData value
+                  |
+                  v
+read SSTable = "sstable_42"
+                  |
+                  v
+open <Dirpath>/sstable_42
+```
+
+In other words, the metadata files have stable names, while the SSTable name
+stored inside their contents changes after successful compaction. This lets
+the database switch from `sstable_41` to `sstable_42` by atomically updating
+small metadata instead of renaming or overwriting the SSTable itself.
+
 ---
 
 ## 2. Why a Fixed SSTable Name Is No Longer Enough
