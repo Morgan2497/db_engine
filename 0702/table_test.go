@@ -1,8 +1,6 @@
 package kv
 
 import (
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -11,10 +9,7 @@ import (
 
 func TestTableByPKey(t *testing.T) {
 	db := DB{}
-	db.KV.log.FileName = ".test_db"
-	defer os.Remove(db.KV.log.FileName)
-
-	os.Remove(db.KV.log.FileName)
+	db.KV.Options.Dirpath = t.TempDir()
 	err := db.Open()
 	assert.Nil(t, err)
 	defer db.Close()
@@ -86,11 +81,9 @@ func logSQLResult(t *testing.T, r SQLResult) {
 }
 
 func TestSQLByPKey(t *testing.T) {
+	dbDir := t.TempDir()
 	db := DB{}
-	db.KV.log.FileName = ".test_db"
-	defer os.Remove(db.KV.log.FileName)
-
-	os.Remove(db.KV.log.FileName)
+	db.KV.Options.Dirpath = dbDir
 	err := db.Open()
 	assert.Nil(t, err)
 	defer db.Close()
@@ -128,7 +121,7 @@ func TestSQLByPKey(t *testing.T) {
 	err = db.Close()
 	require.Nil(t, err)
 	db = DB{}
-	db.KV.log.FileName = ".test_db"
+	db.KV.Options.Dirpath = dbDir
 	err = db.Open()
 	require.Nil(t, err)
 
@@ -147,10 +140,7 @@ func TestSQLByPKey(t *testing.T) {
 
 func TestSQLSelectAndUpdateExpressions(t *testing.T) {
 	db := DB{}
-	db.KV.log.FileName = ".test_db_0505_expr"
-	defer os.Remove(db.KV.log.FileName)
-
-	os.Remove(db.KV.log.FileName)
+	db.KV.Options.Dirpath = t.TempDir()
 	require.NoError(t, db.Open())
 	defer db.Close()
 
@@ -196,10 +186,7 @@ func TestSQLSelectAndUpdateExpressions(t *testing.T) {
 
 func TestIterByPKey(t *testing.T) {
 	db := DB{}
-	db.KV.log.FileName = ".test_db"
-	defer os.Remove(db.KV.log.FileName)
-
-	os.Remove(db.KV.log.FileName)
+	db.KV.Options.Dirpath = t.TempDir()
 	err := db.Open()
 	assert.Nil(t, err)
 	defer db.Close()
@@ -467,7 +454,7 @@ func TestMatchRangeTupleAndReversedComparison(t *testing.T) {
 
 func TestSQLRangeSelectUpdateDelete(t *testing.T) {
 	db := DB{}
-	db.KV.log.FileName = filepath.Join(t.TempDir(), "range-sql.log")
+	db.KV.Options.Dirpath = t.TempDir()
 	require.NoError(t, db.Open())
 	defer db.Close()
 
@@ -532,7 +519,7 @@ func TestSQLRangeSelectUpdateDelete(t *testing.T) {
 
 func TestSQLCompositeTupleRange(t *testing.T) {
 	db := DB{}
-	db.KV.log.FileName = filepath.Join(t.TempDir(), "tuple-range-sql.log")
+	db.KV.Options.Dirpath = t.TempDir()
 	require.NoError(t, db.Open())
 	defer db.Close()
 

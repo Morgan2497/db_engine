@@ -2,12 +2,24 @@ package kv
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path"
 	"slices"
 )
 
+type KVOptions struct {
+	Dirpath string
+}
+
 type KV struct {
+	Options KVOptions
+	// metadata
+	meta    KVMetaStore
+	version uint64
+	//data
 	log  Log         // WAL: durable recent-write history.
 	mem  SortedArray // MemTale: queryable recent changes.
 	main SortedFile  // SSTable: durable older database state.
@@ -23,13 +35,39 @@ func (kv *KV) Open() (err error) {
 }
 
 func (kv *KV) openAll() error {
+	// return an error for permission denied, invalid path, disk/filesystem error.
+	// okay for dir creation, dir already exists.
+	err := os.Mkdir(kv.Options.Dirpath, 0o755)
+	// if already exists, it returns an error.
+	if err != nil && !errors.Is(err, fs.ErrExist) {
+		return err
+	}
+
+	if err := kv.openMeta(); err != nil {
+		return err
+	}
+
 	if err := kv.openLog(); err != nil {
 		return err
 	}
 	return kv.openSSTable()
 }
 
+func (kv *KV) openMeta() error {
+	kv.meta.slots[0].FileName = path.Join(kv.Options.Dirpath, "meta0")
+
+	kv.meta.slots[1].FileName = path.Join(kv.Options.Dirpath, "meta1")
+
+	if err := kv.meta.Open(); err != nil {
+		return err
+	}
+
+	kv.MultiClosers = append(kv.MultiClosers, &kv.meta)
+	return nil
+}
+
 func (kv *KV) openLog() error {
+	kv.log.FileName = path.Join(kv.Options.Dirpath, "kv_log")
 	if err := kv.log.Open(); err != nil {
 		return err
 	}
@@ -65,7 +103,11 @@ func (kv *KV) openLog() error {
 }
 
 func (kv *KV) openSSTable() error {
-	if kv.main.FileName != "" {
+	meta := kv.meta.Get()
+	kv.version = meta.Version
+
+	if meta.SSTable != "" {
+		kv.main.FileName = path.Join(kv.Options.Dirpath, meta.SSTable)
 		if err := kv.main.Open(); err != nil {
 			return err
 		}
@@ -298,35 +340,42 @@ func (kv *KV) Range(start, stop []byte, desc bool) (*RangedKVIter, error) {
 }
 
 func (kv *KV) Compact() error {
-	check(kv.main.FileName != "")
-
-	// 1. Merge MemTable and SSTable, output to a temporary file.
-	fp, err := os.CreateTemp(path.Dir(kv.main.FileName), "tmp_sstable")
-	if err != nil {
-		return err
-	}
-	filename := fp.Name()
-	_ = fp.Close()
-	defer os.Remove(filename)
-
+	// reserve a new unique sstable version.
+	kv.version++
+	// create a new version for upsert.
+	sstable := fmt.Sprintf("sstable_%d", kv.version)
+	// becomes something like kv_test/sstable_3
+	filename := path.Join(kv.Options.Dirpath, sstable)
 	file := SortedFile{FileName: filename}
-	m := MergedSortedKV{&kv.mem, &kv.main}
-	if err := file.CreateFromSorted(m); err != nil {
+
+	// combine recent memtable data iwth the old sstable.
+	merged := MergedSortedKV{&kv.mem, &kv.main}
+
+	// write the recent memtable data wit the old sstable.
+	if err := file.CreateFromSorted(merged); err != nil {
+		_ = os.Remove(filename)
 		return err
 	}
 
-	// 2. Replace the original SSTable (atomic operation).
+	// prepare metadata that points to the new sstable.
+	meta := kv.meta.Get()
+	meta.Version = kv.version
+	meta.SSTable = sstable
+
+	// atomically store the new metadata.
+	if err := kv.meta.Set(meta); err != nil {
+		_ = file.Close()
+		return err
+	}
+
+	// ------------ At this point the old one can go ------------
 	_ = kv.main.Close()
-	_ = file.Close()
-	if err := renameSync(file.FileName, kv.main.FileName); err != nil {
-		_ = kv.main.Open()
-		return err
-	}
-	if err = kv.main.Open(); err != nil {
-		return err
-	}
+	_ = os.Remove(kv.main.FileName)
 
-	// 3. Drop the MemTable and the log.
+	// make the new sstable durable (main one)
+	kv.main = file
+
 	kv.mem.Clear()
+
 	return kv.log.Truncate()
 }
