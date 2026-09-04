@@ -1,4 +1,4 @@
-package db0605
+package kv
 
 import "io"
 
@@ -13,4 +13,3 @@ func (mc *MultiClosers) Close() (reterr error) {
 	*mc = nil
 	return reterr
 }
-// QzBQWVJJOUhU https://trialofcode.org/

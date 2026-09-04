@@ -1,4 +1,4 @@
-package db0601
+﻿package db0601
 
 import (
 	"encoding/binary"
@@ -80,3 +80,4 @@ func (file *SortedFile) writeSortedFile(kv SortedKV) (err error) {
 	return file.fp.Sync()
 }
 // QzBQWVJJOUhU https://trialofcode.org/
+
