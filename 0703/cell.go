@@ -70,7 +70,7 @@ func encodeStrKey(toAppend []byte, input []byte) []byte {
 }
 
 func decodeStrKey(data []byte) (out []byte, rest []byte, err error) {
-	idx := 0 
+	idx := 0
 	for idx < len(data) {
 		if data[idx] == 0x00 {
 			// structural boundary reached. Return the decoded string and unread bytes.
@@ -82,7 +82,7 @@ func decodeStrKey(data []byte) (out []byte, rest []byte, err error) {
 			if idx >= len(data) {
 				return nil, nil, errors.New("unexpected EOF during escape sequence.")
 			}
-			// Restore the original byte by subtracting 1 
+			// Restore the original byte by subtracting 1
 			out = append(out, data[idx]-1)
 		} else {
 			// Normal character
@@ -112,7 +112,7 @@ func (cell *Cell) EncodeKey(toAppend []byte) []byte {
 	// C style Null-Terminated architecture.
 	switch cell.Type {
 	case TypeI64:
-		// Map signed int64 to unsigned space by flippint the Most Significant Bit 
+		// Map signed int64 to unsigned space by flippint the Most Significant Bit
 		unsigned := uint64(cell.I64) ^ (1 << 63)
 		return binary.BigEndian.AppendUint64(toAppend, unsigned)
 
@@ -145,9 +145,8 @@ func (cell *Cell) DecodeKey(data []byte) (rest []byte, err error) {
 		}
 		cell.Str = out
 		return rest, nil
-	
+
 	default:
 		return data, errors.New("unknown cell type")
 	}
 }
-

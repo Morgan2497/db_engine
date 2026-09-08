@@ -460,7 +460,7 @@ func (p *Parser) parseDelete(out *StmtDelete) error {
 	if out.table, ok = p.tryName(); !ok {
 		return errors.New("expect table name")
 	}
-	
+
 	condition, err := p.parseWhere()
 	if err != nil {
 		return err
@@ -478,7 +478,7 @@ func (p *Parser) parseAtom() (expr interface{}, err error) {
 	if name, ok := p.tryName(); ok {
 		return name, nil
 	}
-	
+
 	cell := &Cell{}
 	if err := p.parseValue(cell); err != nil {
 		return nil, err
@@ -499,7 +499,7 @@ func (p *Parser) parseTuple() (expr interface{}, err error) {
 		if err != nil {
 			return nil, err
 		}
-		
+
 		tuple.kids = append(tuple.kids, child)
 
 		if !p.tryPunctuation(",") {
@@ -510,10 +510,10 @@ func (p *Parser) parseTuple() (expr interface{}, err error) {
 	if !p.tryPunctuation(")") {
 		return nil, errors.New("expect )")
 	}
-	
+
 	if len(tuple.kids) == 1 {
-  		return tuple.kids[0], nil
-  }
+		return tuple.kids[0], nil
+	}
 
 	return tuple, nil
 }

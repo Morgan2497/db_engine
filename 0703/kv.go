@@ -20,9 +20,9 @@ type KV struct {
 	meta    KVMetaStore
 	version uint64
 	//data
-	log  Log         // WAL: durable recent-write history.
-	mem  SortedArray // MemTale: queryable recent changes.
-	main SortedFile  // SSTable: durable older database state.
+	log  Log          // WAL: durable recent-write history.
+	mem  SortedArray  // MemTale: queryable recent changes.
+	main []SortedFile // SSTable: durable older database state.
 	MultiClosers
 }
 
@@ -105,13 +105,18 @@ func (kv *KV) openLog() error {
 func (kv *KV) openSSTable() error {
 	meta := kv.meta.Get()
 	kv.version = meta.Version
+	kv.main = kv.main[:0]
 
-	if meta.SSTable != "" {
-		kv.main.FileName = path.Join(kv.Options.Dirpath, meta.SSTable)
-		if err := kv.main.Open(); err != nil {
+	for _, sstable := range meta.SSTables {
+		sstable = path.Join(kv.Options.Dirpath, sstable)
+		file := SortedFile{FileName: sstable}
+
+		if err := file.Open(); err != nil {
 			return err
 		}
-		kv.MultiClosers = append(kv.MultiClosers, &kv.main)
+
+		kv.MultiClosers = append(kv.MultiClosers, &file)
+		kv.main = append(kv.main, file)
 	}
 	return nil
 }
@@ -227,8 +232,11 @@ func (kv *KV) Del(key []byte) (deleted bool, err error) {
 }
 
 func (kv *KV) Seek(key []byte) (SortedKVIter, error) {
-	m := MergedSortedKV{&kv.mem, &kv.main}
-	iter, err := m.Seek(key)
+	levels := MergedSortedKV{&kv.mem}
+	for i := range kv.main {
+		levels = append(levels, &kv.main[i])
+	}
+	iter, err := levels.Seek(key)
 	if err != nil {
 		return nil, err
 	}
@@ -348,11 +356,8 @@ func (kv *KV) Compact() error {
 	filename := path.Join(kv.Options.Dirpath, sstable)
 	file := SortedFile{FileName: filename}
 
-	// combine recent memtable data iwth the old sstable.
-	merged := MergedSortedKV{&kv.mem, &kv.main}
-
 	// write the recent memtable data wit the old sstable.
-	if err := file.CreateFromSorted(merged); err != nil {
+	if err := file.CreateFromSorted(&kv.mem); err != nil {
 		_ = os.Remove(filename)
 		return err
 	}
@@ -360,7 +365,7 @@ func (kv *KV) Compact() error {
 	// prepare metadata that points to the new sstable.
 	meta := kv.meta.Get()
 	meta.Version = kv.version
-	meta.SSTable = sstable
+	meta.SSTables = slices.Insert(meta.SSTables, 0, sstable)
 
 	// atomically store the new metadata.
 	if err := kv.meta.Set(meta); err != nil {
@@ -368,12 +373,8 @@ func (kv *KV) Compact() error {
 		return err
 	}
 
-	// ------------ At this point the old one can go ------------
-	_ = kv.main.Close()
-	_ = os.Remove(kv.main.FileName)
-
 	// make the new sstable durable (main one)
-	kv.main = file
+	kv.main = slices.Insert(kv.main, 0, file)
 
 	kv.mem.Clear()
 

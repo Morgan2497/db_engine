@@ -12,20 +12,22 @@ func TestSortedFile(t *testing.T) {
 	sf := SortedFile{FileName: ".test_sorted_file"}
 	defer os.Remove(sf.FileName)
 
-	keys := [][]byte{[]byte("x"), []byte("y")}
-	vals := [][]byte{[]byte("1"), []byte("234")}
-	deleted := []bool{false, false}
+	keys := [][]byte{[]byte("x"), []byte("x2"), []byte("y")}
+	vals := [][]byte{[]byte("1"), []byte(""), []byte("234")}
+	deleted := []bool{false, true, false}
 	err := sf.CreateFromSorted(&SortedArray{keys, vals, deleted})
 	require.Nil(t, err)
 	defer sf.Close()
-	assert.Equal(t, 2, sf.EstimatedSize())
+	assert.Equal(t, 3, sf.EstimatedSize())
 
 	expected := []byte{
-		2, 0, 0, 0, 0, 0, 0, 0,
-		24, 0, 0, 0, 0, 0, 0, 0,
-		34, 0, 0, 0, 0, 0, 0, 0,
-		1, 0, 0, 0, 1, 0, 0, 0, 'x', '1',
-		1, 0, 0, 0, 3, 0, 0, 0, 'y', '2', '3', '4',
+		3, 0, 0, 0, 0, 0, 0, 0,
+		32, 0, 0, 0, 0, 0, 0, 0,
+		43, 0, 0, 0, 0, 0, 0, 0,
+		54, 0, 0, 0, 0, 0, 0, 0,
+		1, 0, 0, 0, 1, 0, 0, 0, 0, 'x', '1',
+		2, 0, 0, 0, 0, 0, 0, 0, 1, 'x', '2',
+		1, 0, 0, 0, 3, 0, 0, 0, 0, 'y', '2', '3', '4',
 	}
 	data, err := os.ReadFile(sf.FileName)
 	require.Nil(t, err)
