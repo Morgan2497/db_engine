@@ -106,4 +106,5 @@ func TestMerge(t *testing.T) {
 	a, b = b, a
 	testMerge(t, a, b)
 }
+
 // QzBQWVJJOUhU https://trialofcode.org/
