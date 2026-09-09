@@ -11,8 +11,7 @@ import (
 )
 
 func TestKVBasic(t *testing.T) {
-	kv := KV{}
-	kv.Options.Dirpath = "test_db"
+	kv := KV{Options: KVOptions{Dirpath: "test_db", LogShreshold: 1}}
 	defer os.RemoveAll(kv.Options.Dirpath)
 
 	os.RemoveAll(kv.Options.Dirpath)
@@ -90,11 +89,11 @@ func TestKVReopen(t *testing.T) {
 
 	for mode := 0; mode < 3; mode++ {
 		os.RemoveAll(path)
-		kv := KV{Options: KVOptions{Dirpath: path}}
+		kv := KV{Options: KVOptions{Dirpath: path, LogShreshold: 1}}
 		err := kv.Open()
 		require.Nil(t, err)
 
-		N := 10
+		N := 20
 		for i := 0; i < N; i++ {
 			key := []byte(fmt.Sprintf("data%d", i))
 			updated, err := kv.Set(key, key)
@@ -282,5 +281,4 @@ func TestKVSeek(t *testing.T) {
 	require.Nil(t, err)
 	assert.False(t, iter.Valid())
 }
-
 // QzBQWVJJOUhU https://trialofcode.org/
