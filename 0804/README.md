@@ -1,61 +1,29 @@
 # Chapter 0804: Transaction Interface
 
-## The idea in one sentence
+## Goal of this chapter
 
 0804 introduces a transaction as a private workspace for a group of KV and DB
-operations: reads can see the transaction's pending writes, while the real
-database is changed only when `Commit()` is called.
+operations. Writes are staged in that workspace, reads see those staged writes,
+and the caller eventually chooses `Commit()` or `Abort()`.
 
-The motivating example is an indexed row. One logical row can produce several
-physical KV entries—a primary entry plus one entry for each secondary index.
-Those entries must be treated as one logical operation. Otherwise a failure in
-the middle of an update can leave the table row and its indexes disagreeing.
-
-```go
-tx := kv.NewTX()
-tx.Set([]byte("k1"), []byte("v1"))
-tx.Set([]byte("k2"), []byte("v2"))
-err := tx.Commit()
-```
-
-The interface is added in this chapter; complete crash atomicity and concurrent
-transaction isolation are deliberately later responsibilities.
-
-## What “transaction” means here
-
-A transaction groups reads and writes into one logical unit. The application
-should be able to perform several operations and then choose one of two
-outcomes:
+The shortest accurate summary is:
 
 ```text
-commit  -> make the staged updates visible and durable
-abort   -> discard the staged updates
+0804  transaction interface + staging + read-your-writes
+0805  crash-safe all-or-nothing transaction
+09xx  isolation between concurrent transactions
 ```
 
-This gives the upper layers a stable unit of work. For example, `DBTX.Update`
-can remove old index entries and create new primary/secondary entries without
-publishing each intermediate state to ordinary reads.
+0804 is therefore a structural step. It creates the API and data flow required
+for atomic transactions, but it does not yet provide every ACID guarantee.
 
-There are two meanings of “transaction processing” that are easy to mix up:
+## Why transactions become necessary now
 
-* In 0804, a transaction is an API and correctness boundary around a set of
-  reads and writes.
-* In DDIA pp. 87–101, OLTP/transaction processing describes a workload: many
-  interactive, low-latency requests that usually read or modify a small number
-  of records by key. It is contrasted with OLAP, where fewer but much larger
-  analytical scans aggregate over historical data.
+Before secondary indexes, one logical row mostly corresponded to one primary
+KV entry. After indexes are added, one row is represented by several physical
+entries.
 
-The concepts are related, but they are not identical. An OLTP request often
-uses a transaction, but “OLTP” by itself does not promise ACID. Likewise, a
-transaction API can be used for work that is not a commercial sale or even for
-more than one statement.
-
-## Why this is needed in this database
-
-Before secondary indexes, one row mostly corresponded to one primary KV entry.
-With indexes, one logical operation has multiple physical effects.
-
-For a table such as:
+Consider:
 
 ```sql
 CREATE TABLE users (
@@ -67,29 +35,159 @@ CREATE TABLE users (
 );
 ```
 
-the row `(10, "LA", "Morgan")` creates entries conceptually like:
+The row `(10, "LA", "Morgan")` is stored conceptually as:
 
 ```text
-primary index:    (id=10)             -> city/name value
-city index:       (city="LA", id=10) -> empty value
+primary entry:    P:(id=10)       -> {city=LA, name=Morgan}
+secondary entry:  I:(city=LA,10)  -> empty
 ```
 
-Updating the city requires at least:
+Changing the city from `LA` to `NY` requires several KV changes:
 
 ```text
-delete old secondary key  (LA, 10)
-write the new primary row  (10) with city=NY
-write new secondary key    (NY, 10)
+1. delete I:(city=LA,10)
+2. update P:(id=10) -> {city=NY, name=Morgan}
+3. insert I:(city=NY,10)
 ```
 
-If those writes are exposed one at a time, a reader could temporarily find a
-row through the old index, fail to find it through the new index, or see an
-index entry whose primary row does not yet match it. A transaction gives the DB
-layer one context in which all of these changes can be assembled.
+These are three physical changes but only one logical row update.
 
-## The design: staged updates plus merged reads
+### Before 0804: every change is immediate
 
-`KVTX` contains the target database and two transaction-local structures:
+```text
+DB.Update(row)
+    │
+    ├─ delete old index ──> append log ──> update mem
+    │
+    ├─ update primary ────> append log ──> update mem
+    │
+    └─ insert new index ──> append log ──> update mem
+```
+
+If an error occurs after the first operation, the database may be left in an
+inconsistent state:
+
+```text
+primary entry:    P:(10) -> city=LA
+old city index:   missing
+new city index:   missing
+```
+
+The DB needs somewhere to assemble all related changes before applying them to
+the base KV store. That workspace is `KVTX`.
+
+## What 0804 adds
+
+```text
+Application / SQL
+        │
+        ▼
+┌──────────────────────────────┐
+│ DBTX                         │
+│ rows, schemas and indexes    │
+│ Insert/Update/Delete/Select  │
+└──────────────┬───────────────┘
+               │ produces physical key/value changes
+               ▼
+┌──────────────────────────────┐
+│ KVTX                         │
+│ private sorted write set     │
+│ Set/Get/Del/Seek             │
+└──────────────┬───────────────┘
+               │ Commit
+               ▼
+┌──────────────────────────────┐
+│ KV                           │
+│ log + MemTable + SSTables    │
+└──────────────────────────────┘
+```
+
+The two transaction types have different responsibilities:
+
+| Type | Understands | Responsibility |
+| --- | --- | --- |
+| `DBTX` | rows, schemas, primary indexes and secondary indexes | Turn one logical DB operation into all required KV operations. |
+| `KVTX` | byte keys, byte values and tombstones | Stage physical changes and provide a transaction-local read view. |
+| `KV` | log, MemTable and SSTables | Store committed data and recover it from disk. |
+
+The central flow is:
+
+```text
+one DBTX operation
+    -> several physical KV operations
+        -> one KVTX write set
+            -> one commit boundary
+```
+
+## Visual walkthrough: updating `LA` to `NY`
+
+At the beginning, only the committed database exists:
+
+```text
+Committed database
+──────────────────────────────────────
+P:(10)       -> {city=LA, name=Morgan}
+I:(LA,10)    -> exists
+```
+
+Create a transaction and update the row:
+
+```go
+tx := db.NewTX()
+updated, err := tx.Update(schema, newRow)
+```
+
+The operation builds a private overlay:
+
+```text
+Committed database                 tx.updates
+────────────────────────           ─────────────────────────────
+P:(10) -> city=LA                  P:(10)     -> city=NY
+I:(LA,10) exists                   I:(LA,10)  -> TOMBSTONE
+                                   I:(NY,10)  -> exists
+```
+
+While the transaction is being assembled:
+
+```text
+base KV state              unchanged
+transaction's own view     reflects the pending NY update
+```
+
+The transaction then has two intended outcomes:
+
+```text
+                         ┌─ Commit ─> append updates to log
+                         │            then apply them to kv.mem
+tx.updates ──────────────┤
+                         └─ Abort ──> abandon the transaction object
+```
+
+After a successful commit:
+
+```text
+Committed database
+──────────────────────────────────────
+P:(10)       -> {city=NY, name=Morgan}
+I:(LA,10)    -> missing
+I:(NY,10)    -> exists
+```
+
+After aborting and discarding the transaction:
+
+```text
+Committed database
+──────────────────────────────────────
+P:(10)       -> {city=LA, name=Morgan}
+I:(LA,10)    -> exists
+I:(NY,10)    -> missing
+```
+
+This diagram describes staging and the intended final outcomes. It does not
+claim that 0804 already provides crash atomicity or isolation from concurrent
+transactions.
+
+## `KVTX`: the private overlay
 
 ```go
 type KVTX struct {
@@ -99,62 +197,134 @@ type KVTX struct {
 }
 ```
 
-### 1. `updates` is the private write set
+### `target`
 
-`KVTX.SetEx` does not immediately modify `KV.mem` and does not immediately
-append a log record. It records the newest value in `tx.updates`. Deletes are
-also represented there as tombstones.
-
-This is the essential separation:
+`target` points to the real KV store. It is needed when the transaction commits:
 
 ```text
-transaction-local state:  tx.updates
-committed in-memory state: kv.mem
-on-disk history:           kv.log
+tx.target.log
+tx.target.mem
+tx.target.main
 ```
 
-The write set is sorted because the existing storage engine already has sorted
-arrays and merged iterators. Staging therefore fits the LSM-style architecture
-instead of introducing a second lookup mechanism.
+### `updates`
 
-### 2. `levels` gives reads the right view
+`updates` is the transaction's private write set. `KVTX.SetEx` and `KVTX.Del`
+change this sorted array rather than immediately changing `kv.mem` or the log.
 
-A transaction must read its own earlier writes:
+```text
+transaction-local:  tx.updates
+committed memory:   kv.mem
+durable history:    kv.log
+older data:         kv.main / SSTables
+```
+
+Deletes are stored as tombstones. Multiple writes to the same key are reduced
+to that key's latest transaction-local state.
+
+### `levels`
+
+`levels` combines the transaction overlay with the existing LSM-tree levels:
+
+```text
+Transaction read
+      │
+      ▼
+┌──────────────────────────┐
+│ 1. tx.updates            │ newest; private pending changes
+├──────────────────────────┤
+│ 2. kv.mem                │ recent committed changes
+├──────────────────────────┤
+│ 3. kv.main[0]            │ SSTable
+├──────────────────────────┤
+│ 4. kv.main[1] ...        │ older SSTables
+└──────────────────────────┘
+```
+
+The first matching entry wins. This makes `tx.updates` act like one additional,
+highest-priority LSM level.
+
+## Read-your-writes
+
+A transaction must see changes it made earlier:
 
 ```go
 tx.Set([]byte("x"), []byte("new"))
-value, ok, _ := tx.Get([]byte("x")) // must return "new"
+value, ok, _ := tx.Get([]byte("x")) // value must be "new"
 ```
 
-`NewTX` creates a merged view with this priority:
+Suppose the levels contain:
 
 ```text
-1. tx.updates  // newest, transaction-local changes
-2. kv.mem      // committed recent changes
-3. kv.main     // immutable sorted files / older levels
+tx.updates:  x -> new
+kv.mem:      x -> old
+SSTable:     x -> older
 ```
 
-`tx.Seek` reads through `MergedSortedKV`, then filters tombstones. In effect,
-the transaction write set behaves like one additional, highest-priority LSM
-level. This is the key implementation insight: read-your-writes can be added
-by composing the existing sorted lookup layers rather than copying the whole
-database.
+The transaction reads `new` because `tx.updates` has the highest priority.
 
-The same view is important for multiple operations in one transaction. A later
-`SetEx`, `Del`, index lookup, or row update must reason about the state produced
-by earlier operations in that same transaction.
+Deletes use the same rule:
 
-### 3. `Commit` applies the staged work
+```text
+tx.updates:  x -> TOMBSTONE
+kv.mem:      x -> old
+```
 
-The intended commit flow in this chapter is:
+The tombstone hides the lower value, so the transaction sees `x` as missing.
+`KVTX.Seek` obtains a merged iterator and `filterDeleted` prevents tombstones
+from appearing as live records.
+
+Read-your-writes is important for more than user-facing reads. A later
+`SetEx`, `Del`, index lookup, or row update in the same transaction must make
+its decision using the state produced by earlier operations in that
+transaction.
+
+## Transaction lifecycle
+
+```text
+NewTX
+  │
+  ├─ Set / Del ──> stage entries in tx.updates
+  │
+  ├─ Get / Seek ─> read updates + mem + SSTables
+  │
+  ├─ Commit ─────> write log entries, then update kv.mem
+  │
+  └─ Abort ──────> stop using and discard the transaction object
+```
+
+### `NewTX`
+
+`NewTX` creates an empty write set and assembles the merged read view:
+
+```go
+func (kv *KV) NewTX() *KVTX {
+    tx := &KVTX{target: kv}
+    tx.levels = MergedSortedKV{&tx.updates, &kv.mem}
+    for i := range kv.main {
+        tx.levels = append(tx.levels, &kv.main[i])
+    }
+    return tx
+}
+```
+
+It does not copy the database. The transaction stores only its own changes and
+reads unchanged data from the underlying levels.
+
+### `Commit`
 
 ```text
 tx.Commit()
-    ├─ write every entry in tx.updates to kv.log
-    └─ apply every entry in tx.updates to kv.mem
+    │
+    ▼
+KV.applyTX(tx)
+    │
+    ├─ updateLog(tx) ──> append every staged entry to kv.log
+    │
+    └─ updateMem(tx) ──> apply every staged entry to kv.mem
 ```
 
-The code delegates this to `KV.applyTX`:
+The implementation is:
 
 ```go
 func (kv *KV) applyTX(tx *KVTX) error {
@@ -166,236 +336,196 @@ func (kv *KV) applyTX(tx *KVTX) error {
 }
 ```
 
-Writing the log before updating memory preserves the existing durability
-ordering: the log is the recovery source, and `mem` is the live lookup state.
-The transaction refactor changes *when* entries are collected, while retaining
-the existing log-plus-memory architecture.
+The log is written before memory because the log is the recovery source. The
+live MemTable is changed only after logging succeeds.
 
-### 4. `Abort` discards the workspace
+However, the entries are still logged individually. If a crash happens halfway
+through `updateLog`, recovery may find only part of the transaction. 0805 adds
+the transaction framing and rollback needed to distinguish a complete commit
+from a partial one.
 
-At this stage `Abort()` has an empty body. That is safe for the current design
-because pending writes exist only in `tx.updates`; they have not changed
-`kv.mem` or the log. Aborting means allowing the transaction object and its
-write set to be discarded.
-
-This is a useful example of an interface arriving before its final machinery.
-The method exists so callers can write correct transaction-shaped code now,
-while later chapters can add stronger rollback behavior for failures during
-commit.
-
-## KV API and DB API
-
-The low-level API is the foundation:
+### `Abort`
 
 ```go
-tx := kv.NewTX()
+func (tx *KVTX) Abort() {}
+```
+
+Before commit, writes exist only in `tx.updates`, so there is nothing in
+`kv.mem` or `kv.log` to undo. Aborting currently means stopping use of the
+transaction and allowing the whole object to be discarded.
+
+This is only a caller-enforced convention. `Abort()` does not:
+
+* clear `tx.updates`;
+* mark the transaction closed;
+* prevent later reads or writes through the object;
+* prevent a later call to `Commit()`.
+
+The caller must not reuse a transaction after aborting it.
+
+## How `DBTX.Update` uses `KVTX`
+
+A logical row update follows this shape:
+
+```text
+DBTX.Update(new row)
+    │
+    ├─ tx.kv.Get(primary key)       read old row through TX view
+    │
+    ├─ tx.Delete(old row)
+    │    ├─ tx.kv.Del(primary key)
+    │    └─ tx.kv.Del(old secondary keys)
+    │
+    ├─ tx.kv.SetEx(new primary entry)
+    └─ tx.kv.SetEx(new secondary entries)
+
+                       all changes land in tx.updates
+                                      │
+                                      ▼
+                                 tx.Commit()
+```
+
+The delete and inserts are visible to later operations in this transaction,
+but they do not change the base KV state while the update is being assembled.
+
+`DBTX.Insert`, `Upsert`, `Delete`, `Select`, `Seek`, `Range`, and `ExecStmt`
+follow the same principle: all lower-level work uses one shared `KVTX`.
+
+## Compatibility with the old API
+
+The original one-operation `KV` and `DB` methods remain available. They are now
+convenience wrappers around transactions:
+
+```text
+kv.Set(key, value)
+    │
+    ├─ tx := kv.NewTX()
+    ├─ tx.Set(key, value)
+    └─ tx.Commit() or tx.Abort()
+```
+
+The same pattern applies to `DB.Insert`, `DB.Update`, and `DB.Delete`.
+
+This provides two API styles:
+
+```go
+// One operation and one implicit transaction.
+db.Insert(schema, row)
+
+// Several operations sharing one explicit transaction.
+tx := db.NewTX()
 defer tx.Abort()
 
-_, err := tx.SetEx(key, value, ModeUpsert)
-if err != nil {
-    return err
-}
-return tx.Commit()
+tx.Insert(schema, row1)
+tx.Update(schema, row2)
+err := tx.Commit()
 ```
 
-The old one-operation `KV` methods remain available as convenience wrappers.
-For example, `KV.Get` creates a transaction, reads through it, and aborts it;
-`KV.SetEx` creates a transaction, performs one staged update, then commits or
-aborts through `abortOrCommit`.
+## What 0804 provides—and what it postpones
 
-The relational layer follows the same pattern:
+### Provided in 0804
 
-```go
-type DBTX struct {
-    kv     *KVTX
-    tables map[string]Schema
-}
-```
+* A transaction object can collect multiple KV operations.
+* Writes and tombstones are staged in a private sorted overlay.
+* Reads in a transaction see its own pending changes.
+* Before `Commit()` begins, staging has not changed `kv.log` or `kv.mem`.
+* A DB operation can send all primary and secondary index changes through one
+  `KVTX`.
+* Existing one-operation APIs continue to work through implicit transactions.
+* The API establishes a `NewTX` → operations → `Commit`/`Abort` convention.
 
-`DB.NewTX` wraps `KV.NewTX`. `DBTX.Insert`, `Select`, `Update`, `Delete`,
-`Seek`, `Range`, and `ExecStmt` operate through that shared transaction. The
-non-transactional `DB` methods remain convenient one-operation calls that
-create a `DBTX` internally.
+### Not yet guaranteed
 
-This layering matters:
+* **Crash atomicity:** log entries are written one at a time. A crash can leave
+  a partial transaction in the log. This is the focus of 0805.
+* **Atomic visibility during commit:** `updateMem` applies entries one at a
+  time. 0804 has no concurrency control preventing another reader from
+  observing that application in progress.
+* **Isolation:** there are no locks, snapshots, transaction versions, or
+  conflict detection. These arrive in the concurrency chapters.
+* **Lifecycle enforcement:** `Commit()` and `Abort()` do not close the object
+  or reject further use.
+* **Nested rollback boundaries:** a statement inside a larger DB transaction
+  may eventually need its own rollback scope. That comes with the following
+  atomicity work.
 
-```text
-DBTX operation
-    -> several primary/index KV operations
-        -> one KVTX write set
-            -> one commit boundary
-```
+The existence of `NewTX`, `Commit`, and `Abort` does not by itself mean that
+the database is fully ACID. 0804 creates the transaction-shaped programming
+model on which those guarantees can be built.
 
-A single SQL statement can therefore be implemented as multiple lower-level
-updates without making the caller manage every physical index entry.
+## Connection to *Designing Data-Intensive Applications*
 
-## How a row update works inside `DBTX`
+### Direct companion: Chapter 7, “Transactions”
 
-The reference implementation follows this shape:
+DDIA Chapter 7 is the closest conceptual match:
 
-1. Encode the row's primary key and value.
-2. Read the existing row through `tx.kv`, so a prior write in this transaction
-   is visible.
-3. Check the requested mode (`Insert`, `Update`, or `Upsert`).
-4. If an old row exists, delete its primary and secondary index entries into the
-   same transaction write set.
-5. Add the new primary entry and all new secondary entries to that write set.
-6. Commit only after the DB operation or statement has succeeded.
-
-Conceptually:
-
-```text
-DBTX.Update(row)
-    ├─ tx.kv.Get(primary key)
-    ├─ tx.Delete(old row)
-    │    ├─ tx.kv.Del(old primary key)
-    │    └─ tx.kv.Del(old secondary keys)
-    ├─ tx.kv.SetEx(new primary key, new value)
-    └─ tx.kv.SetEx(new secondary keys, nil)
-          ... later: one tx.Commit()
-```
-
-The important word is “staged.” The intermediate delete and inserts are
-visible to this transaction's merged read view, but are not yet committed to
-the database's live state.
-
-## What this chapter guarantees—and what it does not
-
-### Guaranteed by the interface/design
-
-* A transaction can contain multiple KV operations.
-* Reads in the transaction see its own pending updates.
-* Deletes hide entries through tombstones in the transaction view.
-* The DB layer can update a row and all of its indexes through one transaction
-  object.
-* Existing single-operation `KV` and `DB` APIs continue to work as wrappers.
-* Transaction code has an explicit commit/abort lifecycle.
-
-### Not fully guaranteed yet
-
-* **Crash atomicity of the entire transaction:** the current commit writes
-  multiple log entries individually. A crash between entries can leave a
-  partially logged transaction. 0805 adds transaction framing/rollback logic.
-* **Concurrent transaction isolation:** there is no locking, snapshot
-  isolation, or conflict detection here. Later concurrency work decides what a
-  transaction may observe from other transactions.
-* **Nested statement transactions:** a DB transaction may eventually contain
-  statements that each need their own rollback boundary. That is addressed in
-  the following atomicity work.
-* **General ACID by merely having `NewTX`:** the presence of a transaction
-  interface is not proof that all ACID properties are implemented.
-
-This boundary is especially important when reading DDIA: the book separates
-the OLTP workload label from ACID guarantees and discusses ACID transactions in
-its later transactions chapter.
-
-## Connection to DDIA pp. 87–101
-
-The useful connection is architectural:
-
-| DDIA observation | Consequence for 0804 |
+| DDIA section | Connection to 0804 |
 | --- | --- |
-| OLTP serves interactive users with low-latency reads/writes | Point lookups and small row updates must remain cheap. |
-| OLTP commonly fetches records through indexes | A row update may touch primary and secondary index keys. |
-| OLAP scans many records and computes aggregates | This project’s sorted/indexed KV path is primarily an OLTP-style path, not a columnar warehouse engine. |
-| Row-oriented/index-oriented engines favor current state | The transaction view must provide a coherent current state while writes are staged. |
-| LSM-style storage turns writes into in-memory changes plus later durable files | `tx.updates` naturally acts as a new in-memory sorted level before commit. |
-| Column stores and materialized aggregates optimize read-heavy analytics but make writes more involved | It reinforces why this chapter focuses on small coordinated writes, while analytics would need different physical structures. |
+| pp. 213–215, introduction | Defines a transaction as a group of reads and writes with `commit` or `abort` as the final outcome. |
+| pp. 215–218, ACID | Separates atomicity, consistency, isolation, and durability, showing why a transaction API alone is not full ACID. |
+| pp. 219–221, single-object and multi-object operations | Explains why several writes sometimes need one all-or-nothing boundary. |
+| pp. 221–223, multi-object transactions and aborts | Explicitly identifies secondary indexes as separate objects that can become inconsistent, matching 0804's motivation. |
+| pp. 224–253, isolation levels | Describes concurrency problems and guarantees that 0804 intentionally postpones. |
 
-So the books meet at the boundary between application behavior and storage
-design: the workload determines what operations need to be fast, and the
-storage layout determines how those operations are coordinated. 0804 applies
-that reasoning to the OLTP side by introducing a transaction context over the
-existing sorted KV engine.
-
-## The closest DDIA chapter: Chapter 7, “Transactions”
-
-If the goal is to understand the transaction interface in 0804, DDIA Chapter 7
-is the important reading—not pp. 87–101. The most relevant sections are:
-
-| DDIA section | Why it maps to 0804 |
-| --- | --- |
-| pp. 213–215, introduction and “The slippery concept of a transaction” | Defines a transaction as a group of reads/writes with an all-or-nothing `commit` or `abort` outcome. This is the conceptual basis for `NewTX`, `Commit`, and `Abort`. |
-| pp. 215–218, ACID | Separates atomicity, consistency, isolation, and durability. It prevents us from calling the 0804 interface fully ACID before later chapters implement crash atomicity and isolation. |
-| pp. 219–221, single-object and multi-object operations | Explains why several writes must be coordinated and how logs help with crash recovery. This is directly relevant to a row update producing multiple KV entries. |
-| pp. 221–223, “The need for multi-object transactions” and “Handling errors and aborts” | The closest match: it explicitly discusses secondary indexes as separate objects that can become inconsistent without a transaction, and explains abort/retry as the error-handling model. |
-| pp. 224 onward, weak isolation levels | Describes the concurrency work that 0804 intentionally postpones: read committed, snapshot isolation, lost updates, write skew, and serializability. |
-
-The most important correspondence is:
+The central correspondence is:
 
 ```text
-DDIA:      group writes to multiple objects; commit all or abort all
-0804:      stage primary/index KV entries in tx.updates; Commit applies them
-
-DDIA:      secondary indexes are separate objects that must stay in sync
-0804:      DBTX stages deletion of old index keys and insertion of new keys
-
-DDIA:      abort should discard partial work and permit safe retry
-0804:      staged writes make Abort cheap now; durable rollback is deferred
+DDIA                         0804
+───────────────────────────  ─────────────────────────────────────
+group related operations     collect entries in tx.updates
+secondary indexes must sync  route all index changes through DBTX
+read pending own writes      put tx.updates above the base LSM tree
+commit or abort              expose Commit() and Abort()
+atomicity required           interface now; crash atomicity in 0805
 ```
 
-There is also an important implementation gap. DDIA uses “atomicity” to mean
-that if a fault occurs halfway through a transaction, all prior writes are
-discarded. In 0804, `Abort()` discards uncommitted in-memory staging, but the
-current `Commit()` writes multiple log entries one by one. A crash during that
-sequence could still leave a partial transaction in the log. That is why the
-0804 text correctly treats this as an interface/refactoring step and leaves
-full transaction atomicity to 0805.
-
-For review, read 0804 alongside DDIA Chapter 7 in this order:
+The most useful reading order is:
 
 1. DDIA pp. 213–215: what problem transactions solve.
-2. DDIA pp. 215–218: what each ACID word actually means.
-3. DDIA pp. 219–223: why multi-object/index updates need transactions.
-4. 0804: how a sorted transaction overlay implements the first useful part of
-   that model.
-5. DDIA pp. 224–253: what additional machinery is needed for concurrent
-   transactions.
+2. DDIA pp. 215–218: what each ACID term means.
+3. DDIA pp. 219–223: why multi-object and index updates need transactions.
+4. 0804: how this engine builds a transaction-local sorted overlay.
+5. DDIA pp. 224–253: what concurrent transactions additionally require.
 
-## A concrete mental model
+### Supporting background: DDIA pp. 87–101
 
-Think of `KVTX` as a private overlay, not as a copy of the database:
+Pages 87–101 discuss OLTP versus OLAP rather than the transaction interface.
+They still provide useful workload context:
 
-```text
-committed database:       a=old, b=old
-transaction overlay:     a=new, c=created, b=deleted
+| Term | Meaning | Connection to this project |
+| --- | --- | --- |
+| OLTP | Many low-latency operations on a small number of records, usually found by key or index. | This engine's indexed row operations follow an OLTP-style access pattern. |
+| OLAP | Large scans and aggregates over historical data. | Columnar storage and materialized aggregates address a different problem. |
+| Transaction | A correctness/programming abstraction that groups operations. | `DBTX` and `KVTX` begin implementing this abstraction. |
+| ACID | A collection of transaction guarantees. | Only part of the machinery exists in 0804. |
 
-transaction reads:       a=new, c=created, b=missing
-other database readers:  a=old, b=old, c=missing
-
-after Commit:             a=new, b=missing, c=created
-after Abort:              a=old, b=old, c=missing
-```
-
-The overlay is small and sorted; the base database remains available beneath
-it. This is why the design is efficient enough for the current LSM-style
-engine and why read-your-writes works naturally.
+OLTP is a workload description; it does not automatically imply ACID.
 
 ## Review checklist
 
-When reviewing this chapter, be able to answer:
+You understand this chapter if you can answer these questions:
 
-1. Why does adding a secondary index turn one row update into a multi-key
-   operation?
-2. Why must `tx.updates` have higher read priority than `kv.mem` and SSTables?
-3. What happens when a key is deleted in the transaction but still exists in a
-   lower storage level?
-4. Why can the old `KV.Set` API be implemented as “create transaction, stage,
-   commit”?
-5. Why is an empty `Abort()` sufficient for staged writes in 0804?
-6. Why does the current `Commit()` still fail to provide crash atomicity for a
-   multi-entry transaction?
-7. What is the difference between the OLTP workload discussed by DDIA and the
-   ACID transaction abstraction implemented here?
-8. Why would the techniques described by DDIA for column-oriented OLAP storage
-   not replace this transaction interface?
+1. Why does one indexed row produce several physical KV entries?
+2. What inconsistent states can occur if those entries are updated immediately?
+3. Why does `KVTX` store changes in `tx.updates` instead of `kv.mem`?
+4. Why is `tx.updates` the highest-priority merged LSM level?
+5. How does a tombstone hide an older value from transaction reads?
+6. What is the difference between `DBTX` and `KVTX`?
+7. Why does commit write the log before updating memory?
+8. Why is an empty `Abort()` sufficient only if the transaction is discarded?
+9. Why is 0804 not yet crash-atomic or isolated?
+10. What does 0805 need to add on top of this interface?
+11. How is the OLTP workload different from an ACID transaction guarantee?
 
 ## Source notes
 
 * *Database Internals in 45 Steps (Go)*, `0804: Transaction Interface`, pp.
   87–89: transaction API, staged updates, read-your-writes, commit/abort, and
   DB transaction wrapping.
+* Martin Kleppmann, *Designing Data-Intensive Applications*, Chapter 7,
+  especially pp. 213–223: transaction boundaries, ACID, multi-object updates,
+  secondary-index consistency, commit, abort, and retry; pp. 224–253 continue
+  into isolation and concurrency anomalies.
 * Martin Kleppmann, *Designing Data-Intensive Applications*, pp. 87–101:
-  OLTP versus OLAP, data warehousing, star schemas, column-oriented storage,
-  compression, sorted column storage, LSM-backed writes, and materialized
-  aggregates. The detailed ACID transaction discussion is later in the book.
+  OLTP versus OLAP, data warehousing, column-oriented storage, LSM-backed
+  writes, and materialized aggregates.
