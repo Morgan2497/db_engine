@@ -28,13 +28,15 @@ should be able to perform several operations and then choose one of two
 outcomes:
 
 ```text
-commit  -> make the staged updates visible and durable
-abort   -> discard the staged updates
+commit  -> write the staged entries to the log, then apply them to memory
+abort   -> abandon the transaction and its private staged entries
 ```
 
 This gives the upper layers a stable unit of work. For example, `DBTX.Update`
 can remove old index entries and create new primary/secondary entries without
-publishing each intermediate state to ordinary reads.
+changing the base KV state while those entries are being assembled. However,
+0804 does not yet guarantee that concurrent readers see all committed entries
+appear at exactly the same instant; concurrency control comes later.
 
 There are two meanings of “transaction processing” that are easy to mix up:
 
@@ -183,6 +185,36 @@ The method exists so callers can write correct transaction-shaped code now,
 while later chapters can add stronger rollback behavior for failures during
 commit.
 
+There is an important limitation: `Abort()` does not clear `tx.updates`, mark
+the transaction closed, or prevent a later call to `Commit()`. The caller must
+stop using the transaction after aborting it. Thus, 0804 introduces the
+lifecycle *convention*, but does not yet enforce a transaction state machine.
+
+## Transaction lifecycle at a glance
+
+```text
+NewTX
+  │
+  ├─ Set / Del ──> stage entries in tx.updates
+  │
+  ├─ Get / Seek ─> read tx.updates, then kv.mem, then SSTables
+  │
+  ├─ Commit ─────> write log entries, then update kv.mem
+  │                 0804: interface and staging
+  │                 0805: crash-safe all-or-nothing transaction
+  │
+  └─ Abort ──────> discard the transaction object
+                    0804: caller-enforced convention
+```
+
+The shortest accurate summary is:
+
+```text
+0804 gives us batching and read-your-writes.
+0805 gives the batch crash atomicity.
+09xx adds rules for concurrent transactions.
+```
+
 ## KV API and DB API
 
 The low-level API is the foundation:
@@ -261,24 +293,31 @@ the database's live state.
 
 ## What this chapter guarantees—and what it does not
 
-### Guaranteed by the interface/design
+### Provided by the 0804 interface/design
 
 * A transaction can contain multiple KV operations.
 * Reads in the transaction see its own pending updates.
 * Deletes hide entries through tombstones in the transaction view.
+* Before `Commit()` begins, staging has not modified `kv.log` or `kv.mem`.
 * The DB layer can update a row and all of its indexes through one transaction
   object.
 * Existing single-operation `KV` and `DB` APIs continue to work as wrappers.
-* Transaction code has an explicit commit/abort lifecycle.
+* The API names an explicit commit/abort lifecycle for callers to follow.
 
 ### Not fully guaranteed yet
 
 * **Crash atomicity of the entire transaction:** the current commit writes
   multiple log entries individually. A crash between entries can leave a
   partially logged transaction. 0805 adds transaction framing/rollback logic.
+* **Atomic visibility during commit:** `updateMem` applies entries one by one.
+  Without concurrency control, 0804 does not promise that another reader can
+  never observe that application in progress.
 * **Concurrent transaction isolation:** there is no locking, snapshot
   isolation, or conflict detection here. Later concurrency work decides what a
   transaction may observe from other transactions.
+* **Lifecycle enforcement:** `Abort()` and `Commit()` do not close the object or
+  reject further use. Correct lifecycle handling is currently the caller's
+  responsibility.
 * **Nested statement transactions:** a DB transaction may eventually contain
   statements that each need their own rollback boundary. That is addressed in
   the following atomicity work.
@@ -289,29 +328,10 @@ This boundary is especially important when reading DDIA: the book separates
 the OLTP workload label from ACID guarantees and discusses ACID transactions in
 its later transactions chapter.
 
-## Connection to DDIA pp. 87–101
-
-The useful connection is architectural:
-
-| DDIA observation | Consequence for 0804 |
-| --- | --- |
-| OLTP serves interactive users with low-latency reads/writes | Point lookups and small row updates must remain cheap. |
-| OLTP commonly fetches records through indexes | A row update may touch primary and secondary index keys. |
-| OLAP scans many records and computes aggregates | This project’s sorted/indexed KV path is primarily an OLTP-style path, not a columnar warehouse engine. |
-| Row-oriented/index-oriented engines favor current state | The transaction view must provide a coherent current state while writes are staged. |
-| LSM-style storage turns writes into in-memory changes plus later durable files | `tx.updates` naturally acts as a new in-memory sorted level before commit. |
-| Column stores and materialized aggregates optimize read-heavy analytics but make writes more involved | It reinforces why this chapter focuses on small coordinated writes, while analytics would need different physical structures. |
-
-So the books meet at the boundary between application behavior and storage
-design: the workload determines what operations need to be fast, and the
-storage layout determines how those operations are coordinated. 0804 applies
-that reasoning to the OLTP side by introducing a transaction context over the
-existing sorted KV engine.
-
 ## The closest DDIA chapter: Chapter 7, “Transactions”
 
-If the goal is to understand the transaction interface in 0804, DDIA Chapter 7
-is the important reading—not pp. 87–101. The most relevant sections are:
+DDIA Chapter 7 is the direct conceptual companion to 0804. The most relevant
+sections are:
 
 | DDIA section | Why it maps to 0804 |
 | --- | --- |
@@ -352,6 +372,26 @@ For review, read 0804 alongside DDIA Chapter 7 in this order:
 5. DDIA pp. 224–253: what additional machinery is needed for concurrent
    transactions.
 
+## Supporting DDIA background: pp. 87–101
+
+Pages 87–101 discuss OLTP versus OLAP, not the transaction interface itself.
+They are useful architectural background because they explain the workload for
+which this database is being optimized:
+
+| DDIA observation | Connection to 0804 |
+| --- | --- |
+| OLTP performs many low-latency operations on a small number of records, usually found by key or index. | A logical row update must efficiently coordinate a small set of primary and secondary index entries. |
+| OLAP scans and aggregates many historical rows. | Columnar storage and materialized aggregates solve a different problem from transaction coordination. |
+| LSM-style engines stage writes in sorted memory before merging them into durable files. | `tx.updates` reuses that same sorted-layer idea as a transaction-local overlay. |
+
+The terminology must remain separate:
+
+```text
+OLTP         = a workload pattern
+transaction = a correctness/programming abstraction
+ACID        = a set of guarantees, only some of which exist in 0804
+```
+
 ## A concrete mental model
 
 Think of `KVTX` as a private overlay, not as a copy of the database:
@@ -363,13 +403,16 @@ transaction overlay:     a=new, c=created, b=deleted
 transaction reads:       a=new, c=created, b=missing
 other database readers:  a=old, b=old, c=missing
 
-after Commit:             a=new, b=missing, c=created
-after Abort:              a=old, b=old, c=missing
+after successful Commit:  a=new, b=missing, c=created
+after discard/Abort:      a=old, b=old, c=missing
 ```
 
 The overlay is small and sorted; the base database remains available beneath
 it. This is why the design is efficient enough for the current LSM-style
-engine and why read-your-writes works naturally.
+engine and why read-your-writes works naturally. This diagram describes the
+staging period and the intended final outcomes. It does not claim snapshot
+isolation or atomic visibility to concurrent readers while `Commit()` is
+running.
 
 ## Review checklist
 
@@ -385,9 +428,10 @@ When reviewing this chapter, be able to answer:
 5. Why is an empty `Abort()` sufficient for staged writes in 0804?
 6. Why does the current `Commit()` still fail to provide crash atomicity for a
    multi-entry transaction?
-7. What is the difference between the OLTP workload discussed by DDIA and the
+7. Why must the caller stop using a transaction after `Abort()` in 0804?
+8. What is the difference between the OLTP workload discussed by DDIA and the
    ACID transaction abstraction implemented here?
-8. Why would the techniques described by DDIA for column-oriented OLAP storage
+9. Why would the techniques described by DDIA for column-oriented OLAP storage
    not replace this transaction interface?
 
 ## Source notes
@@ -398,4 +442,8 @@ When reviewing this chapter, be able to answer:
 * Martin Kleppmann, *Designing Data-Intensive Applications*, pp. 87–101:
   OLTP versus OLAP, data warehousing, star schemas, column-oriented storage,
   compression, sorted column storage, LSM-backed writes, and materialized
-  aggregates. The detailed ACID transaction discussion is later in the book.
+  aggregates.
+* Martin Kleppmann, *Designing Data-Intensive Applications*, Chapter 7,
+  especially pp. 213–223: transaction boundaries, ACID, multi-object updates,
+  secondary-index consistency, commit, abort, and retry; pp. 224–253 continue
+  into isolation and concurrency anomalies.
