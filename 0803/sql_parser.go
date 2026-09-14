@@ -51,6 +51,10 @@ type StmtCreateTable struct {
 	indices [][]string
 }
 
+// StmtCreatTable preserves the book's original identifier so its tests can be
+// used unchanged. StmtCreateTable remains the correctly spelled local name.
+type StmtCreatTable = StmtCreateTable
+
 type ExprAssign struct {
 	column string
 	expr   interface{} // *ExprUnOp | *ExprBinOp | string | *Cell

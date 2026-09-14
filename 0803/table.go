@@ -19,10 +19,12 @@ type SQLResult struct {
 }
 
 type RowIterator struct {
-	schema *Schema
-	iter   *RangedKVIter
-	valid  bool // decode result (err != ErrOutofRange), a cached boolean telling if the last move was successful.
-	row    Row  // decode result, a cached Go struct (row) holding the fully decoded row data.
+	db      *DB
+	schema  *Schema
+	indexNo int
+	iter    *RangedKVIter
+	valid   bool // decode result (err != ErrOutofRange), a cached boolean telling if the last move was successful.
+	row     Row  // decode result, a cached Go struct (row) holding the fully decoded row data.
 }
 
 type ExprOp uint8
@@ -36,6 +38,7 @@ type RangeReq struct {
 	StopCmp  ExprOp
 	Start    []Cell
 	Stop     []Cell
+	IndexNo  int
 }
 
 type ExprBinOp struct {
@@ -105,7 +108,7 @@ func (iter *RowIterator) Next() (err error) {
 	if err = iter.iter.Next(); err != nil {
 		return err
 	}
-	iter.valid, err = decodeKVIter(iter.schema, iter.iter, iter.row)
+	iter.valid, err = iter.decodeKVIter()
 	return err
 }
 
@@ -116,25 +119,37 @@ It does three things.
 2. Decode and verify the key.
 3. Decode the value.
 */
-func decodeKVIter(schema *Schema, iter *RangedKVIter, row Row) (bool, error) {
-	// 1. Check if the raw KV cursor is even active.
-	if !iter.Valid() {
+func (iter *RowIterator) decodeKVIter() (bool, error) {
+	if !iter.iter.Valid() {
 		return false, nil
 	}
 
-	// 2. Extract and decode the raw key, checking table boundaries.
-	key := iter.Key()
-	if err := row.DecodeKey(schema, 0, key); err != nil {
+	if err := iter.row.DecodeKey(
+		iter.schema,
+		iter.indexNo,
+		iter.iter.Key(),
+	); err != nil {
 		if errors.Is(err, ErrOutOfRange) {
-			return false, nil // hits table boundary.
+			return false, nil
 		}
-		return false, err // error occured.
+		return false, err
 	}
 
-	// 3. Extract and decode the value payload for remaining columns.
-	val := iter.Val()
-	if err := row.DecodeVal(schema, val); err != nil {
-		return false, err
+	if iter.indexNo > 0 {
+		ok, err := iter.db.Select(iter.schema, iter.row)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return false, errors.New("inconsistent index")
+		}
+	} else {
+		if err := iter.row.DecodeVal(
+			iter.schema,
+			iter.iter.Val(),
+		); err != nil {
+			return false, err
+		}
 	}
 	return true, nil
 }
@@ -158,7 +173,7 @@ func (db *DB) Seek(schema *Schema, row Row) (*RowIterator, error) {
 		row:    schema.NewRow(),
 	}
 
-	iter.valid, err = decodeKVIter(schema, kvIter, iter.row)
+	iter.valid, err = iter.decodeKVIter()
 	if err != nil {
 		return nil, err
 	}
@@ -370,13 +385,13 @@ func matchCmp(cond interface{}) (ExprOp, []string, []Cell, bool) {
 	return reverseComparison(op), names, cells, true
 }
 
-func isPKeyPrefix(schema *Schema, names []string, cells []Cell) bool {
-	if len(names) == 0 || len(names) != len(cells) || len(names) > len(schema.Indices[0]) {
+func isPKeyPrefix(schema *Schema, indexNo int, names []string, cells []Cell) bool {
+	if len(names) == 0 || len(names) != len(cells) || len(names) > len(schema.Indices[indexNo]) {
 		return false
 	}
 
 	for i, name := range names {
-		column := schema.Cols[schema.Indices[0][i]]
+		column := schema.Cols[schema.Indices[indexNo][i]]
 		if name != column.Name || cells[i].Type != column.Type {
 			return false
 		}
@@ -384,19 +399,19 @@ func isPKeyPrefix(schema *Schema, names []string, cells []Cell) bool {
 	return true
 }
 
-func matchRange(schema *Schema, cond interface{}) (*RangeReq, bool) {
+func matchRangeByIndex(schema *Schema, indexNo int, cond interface{}) (*RangeReq, bool) {
 	condition, ok := cond.(*ExprBinOp)
 	if !ok {
 		return nil, false
 	}
 
 	if condition.op == OP_AND {
-		leftRange, leftOK := matchRange(schema, condition.left)
+		leftRange, leftOK := matchRangeByIndex(schema, indexNo, condition.left)
 		if !leftOK {
 			return nil, false
 		}
 
-		rightRange, rightOK := matchRange(schema, condition.right)
+		rightRange, rightOK := matchRangeByIndex(schema, indexNo, condition.right)
 		if !rightOK {
 			return nil, false
 		}
@@ -410,7 +425,10 @@ func matchRange(schema *Schema, cond interface{}) (*RangeReq, bool) {
 			return nil, false
 		}
 
-		combined := &RangeReq{}
+		combined := &RangeReq{
+			IndexNo: indexNo,
+		}
+
 		if leftRange.Start != nil {
 			combined.StartCmp = leftRange.StartCmp
 			combined.Start = leftRange.Start
@@ -430,7 +448,7 @@ func matchRange(schema *Schema, cond interface{}) (*RangeReq, bool) {
 	}
 
 	op, names, cells, ok := matchCmp(cond)
-	if !ok || !isPKeyPrefix(schema, names, cells) {
+	if !ok || !isPKeyPrefix(schema, indexNo, names, cells) {
 		return nil, false
 	}
 
@@ -441,14 +459,26 @@ func matchRange(schema *Schema, cond interface{}) (*RangeReq, bool) {
 			StopCmp:  OP_LE,
 			Start:    cells,
 			Stop:     nil,
+			IndexNo:  indexNo,
 		}, true
 	case OP_LT, OP_LE:
 		return &RangeReq{
-			StartCmp: OP_GE,
-			StopCmp:  op,
-			Start:    nil,
-			Stop:     cells,
+			StartCmp: op,
+			StopCmp:  OP_GE,
+			Start:    cells,
+			Stop:     nil,
+			IndexNo:  indexNo,
 		}, true
+	}
+	return nil, false
+}
+
+func matchRange(schema *Schema, cond interface{}) (*RangeReq, bool) {
+	for indexNo := range schema.Indices {
+		req, ok := matchRangeByIndex(schema, indexNo, cond)
+		if ok {
+			return req, true
+		}
 	}
 	return nil, false
 }
@@ -505,28 +535,6 @@ func matchAllEq(cond interface{}, out []NamedCell) ([]NamedCell, bool) {
 		value:  *value,
 	})
 	return out, true
-}
-
-func makeRow(schema *Schema, names []string, vals []Cell) (Row, error) {
-	row := schema.NewRow()
-	for i, name := range names {
-		idx := -1
-		for j, col := range schema.Cols {
-			if col.Name == name {
-				idx = j
-				break
-			}
-		}
-		if idx < 0 {
-			return nil, errors.New("column not found")
-		}
-
-		if schema.Cols[idx].Type != vals[i].Type {
-			return nil, errors.New("type mismatch")
-		}
-		row[idx] = vals[i]
-	}
-	return row, nil
 }
 
 func subsetRow(row Row, indices []int) (out Row) {
@@ -683,23 +691,23 @@ func (db *DB) execUpdate(stmt *StmtUpdate) (count int, err error) {
 		return 0, err
 	}
 
+	oldRows := []Row{}
 	for ; err == nil && iter.Valid(); err = iter.Next() {
-		row := iter.Row()
+		oldRows = append(oldRows, slices.Clone(iter.Row()))
+	}
+	if err != nil {
+		return 0, err
+	}
 
-		// Evaluate every assignment against the unchanged original row before
-		// applying any of the results.
+	for _, row := range oldRows {
 		updates := make([]NamedCell, len(stmt.value))
-		for i, assignment := range stmt.value {
-			resultCell, evalErr := evalExpr(&schema, row, assignment.expr)
-			if evalErr != nil {
-				return 0, evalErr
+		for i, assign := range stmt.value {
+			cell, err := evalExpr(&schema, row, assign.expr)
+			if err != nil {
+				return 0, err
 			}
-			updates[i] = NamedCell{
-				column: assignment.column,
-				value:  *resultCell,
-			}
+			updates[i] = NamedCell{column: assign.column, value: *cell}
 		}
-
 		if err = fillNonPKey(&schema, updates, row); err != nil {
 			return 0, err
 		}
@@ -711,10 +719,6 @@ func (db *DB) execUpdate(stmt *StmtUpdate) (count int, err error) {
 		if updated {
 			count++
 		}
-	}
-
-	if err != nil {
-		return 0, err
 	}
 	return count, nil
 }
@@ -867,8 +871,8 @@ func (db *DB) Delete(schema *Schema, row Row) (deleted bool, err error) {
 }
 
 func (db *DB) Range(schema *Schema, req *RangeReq) (*RowIterator, error) {
-	start := EncodeKeyPrefix(schema, 0, req.Start, suffixPositive(req.StartCmp))
-	stop := EncodeKeyPrefix(schema, 0, req.Stop, suffixPositive(req.StopCmp))
+	start := EncodeKeyPrefix(schema, req.IndexNo, req.Start, suffixPositive(req.StartCmp))
+	stop := EncodeKeyPrefix(schema, req.IndexNo, req.Stop, suffixPositive(req.StopCmp))
 	desc := isDescending(req.StartCmp)
 	kvIter, err := db.KV.Range(start, stop, desc)
 	if err != nil {
@@ -876,16 +880,14 @@ func (db *DB) Range(schema *Schema, req *RangeReq) (*RowIterator, error) {
 	}
 
 	iter := &RowIterator{
-		schema: schema,
-		iter:   kvIter,
-		row:    schema.NewRow(),
+		db:      db,
+		schema:  schema,
+		indexNo: req.IndexNo,
+		iter:    kvIter,
+		row:     schema.NewRow(),
 	}
 
-	iter.valid, err = decodeKVIter(
-		schema,
-		kvIter,
-		iter.row,
-	)
+	iter.valid, err = iter.decodeKVIter()
 
 	if err != nil {
 		return nil, err

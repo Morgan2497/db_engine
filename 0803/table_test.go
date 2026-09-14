@@ -1,4 +1,4 @@
-package db0803
+package kv
 
 import (
 	"os"
@@ -8,6 +8,24 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func makeCell(v interface{}) Cell {
+	switch value := v.(type) {
+	case int:
+		return Cell{Type: TypeI64, I64: int64(value)}
+	case string:
+		return Cell{Type: TypeStr, Str: []byte(value)}
+	default:
+		panic("unsupported test value")
+	}
+}
+
+func makeRow(vs ...interface{}) (row Row) {
+	for _, value := range vs {
+		row = append(row, makeCell(value))
+	}
+	return row
+}
 
 func TestTableByPKey(t *testing.T) {
 	db := DB{}
@@ -441,4 +459,5 @@ func TestTableIndices(t *testing.T) {
 	require.Nil(t, err)
 	require.Equal(t, []Row{makeRow(2, 0)}, r.Values)
 }
+
 // QzBQWVJJOUhU https://trialofcode.org/
