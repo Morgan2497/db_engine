@@ -42,36 +42,49 @@ primary entry:    P:(id=10)       -> {city=LA, name=Morgan}
 secondary entry:  I:(city=LA,10)  -> empty
 ```
 
-Changing the city from `LA` to `NY` requires several KV changes:
+Changing the city from `LA` to `NY` requires several KV changes. The actual
+`DB.update` path reads the old row, deletes its old entries in index order,
+then inserts the new entries in index order:
 
 ```text
-1. delete I:(city=LA,10)
-2. update P:(id=10) -> {city=NY, name=Morgan}
-3. insert I:(city=NY,10)
+1. delete P:(id=10)
+2. delete I:(city=LA,10)
+3. insert P:(id=10) -> {city=NY, name=Morgan}
+4. insert I:(city=NY,10)
 ```
 
-These are three physical changes but only one logical row update.
+These are four physical changes but only one logical row update. For an
+existing row, the implementation rebuilds its primary and secondary entries;
+the transaction's final write set retains only the newest state for each key.
 
 ### Before 0804: every change is immediate
 
 ```text
 DB.Update(row)
     │
-    ├─ delete old index ──> append log ──> update mem
+    ├─ delete primary ───> append log ──> update mem
     │
-    ├─ update primary ────> append log ──> update mem
+    ├─ delete old index ─> append log ──> update mem
+    │
+    ├─ insert primary ───> append log ──> update mem
     │
     └─ insert new index ──> append log ──> update mem
 ```
 
-If an error occurs after the first operation, the database may be left in an
-inconsistent state:
+An error can interrupt that sequence before all the entries agree. The
+primary-key lookup and city-index lookup may then report different results:
 
-```text
-primary entry:    P:(10) -> city=LA
-old city index:   missing
-new city index:   missing
-```
+| Interruption point | Primary lookup | City-index lookup |
+| --- | --- | --- |
+| After deleting `P:(10)` | Row missing | Old `I:(LA,10)` still points to the missing row. |
+| After deleting `I:(LA,10)` | Row missing | Neither city index finds the row. |
+| After inserting new `P:(10)` | Row says `NY` | `I:(NY,10)` has not been created, so a city lookup misses it. |
+| After inserting `I:(NY,10)` | Row says `NY` | New city index finds the row; entries agree again. |
+
+The index itself has not malfunctioned. The problem is that it is a separate
+KV entry, and one logical update requires several sequential physical changes.
+In 0803, each call to `KV.Del` or `KV.SetEx` can fail after earlier calls have
+already committed.
 
 The DB needs somewhere to assemble all related changes before applying them to
 the base KV store. That workspace is `KVTX`.
@@ -102,13 +115,21 @@ Application / SQL
 └──────────────────────────────┘
 ```
 
-The two transaction types have different responsibilities:
+The two transaction types have different responsibilities. Think of `DBTX` as
+the relational translator, `KVTX` as the private change container, and `KV`
+as the committed storage engine:
 
 | Type | Understands | Responsibility |
 | --- | --- | --- |
 | `DBTX` | rows, schemas, primary indexes and secondary indexes | Turn one logical DB operation into all required KV operations. |
 | `KVTX` | byte keys, byte values and tombstones | Stage physical changes and provide a transaction-local read view. |
 | `KV` | log, MemTable and SSTables | Store committed data and recover it from disk. |
+
+`DBTX` owns a `*KVTX`. It knows *which* primary and secondary entries must
+change; it calls `tx.kv.Get`, `SetEx`, or `Del` for each encoded key. `KVTX`
+does not understand rows or indexes: it only knows how to stage byte-level
+changes, read them back, and apply them on commit. `DBTX.Commit()` and
+`DBTX.Abort()` simply delegate to the underlying `KVTX`.
 
 The central flow is:
 
@@ -134,7 +155,27 @@ Create a transaction and update the row:
 
 ```go
 tx := db.NewTX()
-updated, err := tx.Update(schema, newRow)
+_, err := tx.Update(schema, newRow)
+if err != nil {
+    tx.Abort() // discard the partially staged logical update
+    return err
+}
+return tx.Commit()
+```
+
+`DBTX.Update` first reads the old primary row. That is how it learns the old
+indexed value `LA`: the new row only contains `NY`, but removing the old index
+requires the key `I:(LA,10)`. It stages deletion of both old entries, then
+stages insertion of the new entries. In the final `SortedArray`, the later
+write of `P:(10) -> city=NY` replaces the earlier primary-key tombstone.
+
+```text
+DBTX.Update(new row)
+  ├─ tx.kv.Get(P:(10))        -> recover old city=LA
+  ├─ tx.kv.Del(P:(10))        -> stage primary tombstone
+  ├─ tx.kv.Del(I:(LA,10))     -> stage old-index tombstone
+  ├─ tx.kv.SetEx(P:(10))      -> stage new primary value; replaces tombstone
+  └─ tx.kv.SetEx(I:(NY,10))   -> stage new-index entry
 ```
 
 The operation builds a private overlay:
@@ -185,7 +226,14 @@ I:(NY,10)    -> missing
 
 This diagram describes staging and the intended final outcomes. It does not
 claim that 0804 already provides crash atomicity or isolation from concurrent
-transactions.
+transactions. If an operation returns an error before commit, the caller must
+abort and discard the transaction; an explicit `DBTX` will not do that
+automatically.
+
+For the one-operation `DB.Update` API, the wrapper makes that choice for the
+caller: it commits if the update succeeds and aborts if it returns an error.
+`DBTX.Insert`, `Upsert`, `Delete`, `Select`, `Seek`, `Range`, and `ExecStmt`
+also route their lower-level work through the transaction's shared `KVTX`.
 
 ## `KVTX`: the private overlay
 
@@ -199,13 +247,9 @@ type KVTX struct {
 
 ### `target`
 
-`target` points to the real KV store. It is needed when the transaction commits:
-
-```text
-tx.target.log
-tx.target.mem
-tx.target.main
-```
+`target` points to the real KV store. `Commit()` uses it to write the staged
+entries to the log and then update the MemTable. Reads also use the base
+MemTable and SSTables through `levels`.
 
 ### `updates`
 
@@ -363,34 +407,6 @@ This is only a caller-enforced convention. `Abort()` does not:
 
 The caller must not reuse a transaction after aborting it.
 
-## How `DBTX.Update` uses `KVTX`
-
-A logical row update follows this shape:
-
-```text
-DBTX.Update(new row)
-    │
-    ├─ tx.kv.Get(primary key)       read old row through TX view
-    │
-    ├─ tx.Delete(old row)
-    │    ├─ tx.kv.Del(primary key)
-    │    └─ tx.kv.Del(old secondary keys)
-    │
-    ├─ tx.kv.SetEx(new primary entry)
-    └─ tx.kv.SetEx(new secondary entries)
-
-                       all changes land in tx.updates
-                                      │
-                                      ▼
-                                 tx.Commit()
-```
-
-The delete and inserts are visible to later operations in this transaction,
-but they do not change the base KV state while the update is being assembled.
-
-`DBTX.Insert`, `Upsert`, `Delete`, `Select`, `Seek`, `Range`, and `ExecStmt`
-follow the same principle: all lower-level work uses one shared `KVTX`.
-
 ## Compatibility with the old API
 
 The original one-operation `KV` and `DB` methods remain available. They are now
@@ -410,15 +426,22 @@ This provides two API styles:
 
 ```go
 // One operation and one implicit transaction.
-db.Insert(schema, row)
+_, err := db.Insert(schema, row)
+if err != nil {
+    return err
+}
 
 // Several operations sharing one explicit transaction.
 tx := db.NewTX()
 defer tx.Abort()
 
-tx.Insert(schema, row1)
-tx.Update(schema, row2)
-err := tx.Commit()
+if _, err := tx.Insert(schema, row1); err != nil {
+    return err
+}
+if _, err := tx.Update(schema, row2); err != nil {
+    return err
+}
+return tx.Commit()
 ```
 
 ## What 0804 provides—and what it postpones
@@ -507,15 +530,17 @@ You understand this chapter if you can answer these questions:
 
 1. Why does one indexed row produce several physical KV entries?
 2. What inconsistent states can occur if those entries are updated immediately?
-3. Why does `KVTX` store changes in `tx.updates` instead of `kv.mem`?
-4. Why is `tx.updates` the highest-priority merged LSM level?
-5. How does a tombstone hide an older value from transaction reads?
-6. What is the difference between `DBTX` and `KVTX`?
-7. Why does commit write the log before updating memory?
-8. Why is an empty `Abort()` sufficient only if the transaction is discarded?
-9. Why is 0804 not yet crash-atomic or isolated?
-10. What does 0805 need to add on top of this interface?
-11. How is the OLTP workload different from an ACID transaction guarantee?
+3. Why must `DBTX.Update` read the old row before deleting index entries?
+4. Why does `KVTX` store changes in `tx.updates` instead of `kv.mem`?
+5. Why is `tx.updates` the highest-priority merged LSM level?
+6. How does a tombstone hide an older value from transaction reads?
+7. What is the difference between `DBTX` and `KVTX`?
+8. Why does commit write the log before updating memory?
+9. Why must an explicit `DBTX` be discarded after a failed operation?
+10. Why is an empty `Abort()` sufficient only if the transaction is discarded?
+11. Why is 0804 not yet crash-atomic or isolated?
+12. What does 0805 need to add on top of this interface?
+13. How is the OLTP workload different from an ACID transaction guarantee?
 
 ## Source notes
 
