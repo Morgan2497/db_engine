@@ -24,17 +24,15 @@ type Schema struct {
 	PKey  []int // Which columns are the primary key?
 }
 
-// Encode a Row as KV
-// When user types an SQL to insert into a table, it creates this first like schema.NewRow()
-// {Type: 0, I64: 0, str/int: nil,}
-
+// Row holds one cell per schema column. A key-only lookup may leave the
+// non-primary cells empty until DecodeVal fills them.
 type Row []Cell
 
 func (schema *Schema) NewRow() Row {
 	return make(Row, len(schema.Cols))
 }
 
-// It seriealizes the pk columns to form the physical KV key.
+// EncodeKey serializes primary-key columns to form the physical KV key.
 func (row Row) EncodeKey(schema *Schema) (key []byte) {
 	// 1. Prefix: table name + null-byte separator.
 	key = append([]byte(schema.Table), 0x00)
@@ -42,11 +40,9 @@ func (row Row) EncodeKey(schema *Schema) (key []byte) {
 	check(len(row) == len(schema.Cols))
 
 	for idx, value := range row {
-
-		// Ensure tje cell type matches the shcema definition.
-		check(value.Type == schema.Cols[idx].Type)
-
 		if slices.Contains(schema.PKey, idx) {
+			// A key-only lookup need not fill non-primary cells.
+			check(value.Type == schema.Cols[idx].Type)
 			key = row[idx].Encode(key)
 		}
 
@@ -59,13 +55,12 @@ func (row Row) EncodeVal(schema *Schema) (val []byte) {
 	// 1. Protect the engine from malformed rows.
 	check(len(row) == len(schema.Cols))
 
-	// 2. Iterate sequantially to guarantee strict column ordering.
+	// 2. Iterate in schema column order.
 	for idx := range row {
 		value := row[idx]
-		check(value.Type == schema.Cols[idx].Type)
-
-		// 3. If not pk, then proceed.
+		// 3. Only non-primary cells are encoded and type-checked.
 		if !slices.Contains(schema.PKey, idx) {
+			check(value.Type == schema.Cols[idx].Type)
 			val = row[idx].Encode(val)
 		}
 	}
