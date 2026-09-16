@@ -80,6 +80,18 @@ func TestEvalExprSimpleSubtraction(t *testing.T) {
 	assert.Equal(t, &Cell{Type: TypeI64, I64: 15}, result)
 }
 
+func TestEvalExprStringConcatenation(t *testing.T) {
+	schema, row := evaluationFixture()
+	parser := NewParser("label + label")
+	expr, err := parser.parseAdd()
+	require.NoError(t, err)
+	require.True(t, parser.isEnd())
+
+	result, err := evalExpr(schema, row, expr)
+	require.NoError(t, err)
+	assert.Equal(t, &Cell{Type: TypeStr, Str: []byte("SalesSales")}, result)
+}
+
 func TestEvalExprNestedTree(t *testing.T) {
 	schema, row := evaluationFixture()
 	input := "a - b + c - e"
@@ -119,7 +131,7 @@ func TestEvalExprRejectsTypeMismatch(t *testing.T) {
 	result, err := evalExpr(schema, row, expr)
 
 	t.Logf("[ERROR RESULT] result=%v error=%v", result, err)
-	require.EqualError(t, err, "Type does not match")
+	require.EqualError(t, err, "binary op type mismatch")
 	assert.Nil(t, result)
 }
 
@@ -145,5 +157,11 @@ func TestEvalExprRejectsUnsupportedOperation(t *testing.T) {
 	}
 
 	t.Log("[EXPRESSION] \"Sales\" - \"S\"")
-	t.Log("[TYPE CHECK] Types match, but subtraction is not defined for TypeStr.")	
+	t.Log("[TYPE CHECK] Types match, but subtraction is not defined for TypeStr.")
+
+	result, err := evalExpr(schema, row, expr)
+
+	t.Logf("[ERROR RESULT] result=%v error=%v", result, err)
+	require.EqualError(t, err, "bad binary op")
+	assert.Nil(t, result)
 }
