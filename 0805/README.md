@@ -87,6 +87,284 @@ Atomicity and durability are related but different:
 | Isolation | Can concurrent transactions observe or overwrite one another? | Not implemented here; begins in 0901 |
 | Consistency | Does the transaction preserve application invariants? | The application/DB layer defines valid changes; atomicity helps preserve them |
 
+## The central question: did the storage layers already give us ACID?
+
+No. The layers built before 0805 give us a reliable **storage engine**, but a
+storage engine and a transaction manager answer different questions:
+
+```text
+WAL + MemTable + merge + SSTables
+    "How do I store, retrieve, and recover key/value records?"
+
+Transaction layer
+    "Which group of records counts as one completed change?"
+```
+
+The WAL can preserve every record that reached it and still preserve an
+application state that should never have existed. Durability means that bytes
+survive; it does not by itself mean that a multi-record operation was complete.
+
+Consider a transfer of $100:
+
+```text
+starting state: Alice=500, Bob=200
+
+1. write Alice=400
+2. write Bob=300
+```
+
+If the process crashes between steps 1 and 2, a working WAL may recover
+`Alice=400, Bob=200`. It has durably recovered the one write it received, but
+$100 has disappeared. The missing information is not another key/value record;
+it is the decision that steps 1 and 2 must be accepted or rejected together.
+
+0805 records that decision with `EntryCommit`:
+
+```text
+ADD Alice=400 | ADD Bob=300 | COMMIT
+                                  ▲
+                       durable all-or-nothing boundary
+```
+
+Without the final durable marker, recovery ignores both writes. With it,
+recovery restores both. This is the chapter's concrete meaning of atomicity.
+
+### What each existing layer contributes
+
+| Layer | What it gives us | What it does not decide |
+| --- | --- | --- |
+| WAL | Ordered recovery records | Whether several records form a complete transaction |
+| `fsync` | A durability boundary | Whether application invariants were preserved |
+| MemTable | Fast access to recent state | Crash survival |
+| Merged iterator | One read view across storage levels | Commit/abort status |
+| SSTables | Persistent sorted data | Atomic publication of related changes |
+| `KVTX.updates` | A private in-memory write set | Whether its WAL tail is committed after a crash |
+| 0805 commit protocol | A durable all-or-nothing decision | Concurrent-transaction isolation |
+
+The earlier components are therefore necessary foundations for transactions,
+but they are not the whole ACID contract.
+
+## Sequential mental model: from a database operation to disk
+
+The transaction layer does not replace the WAL, MemTable, or SSTables. It sits
+above them and gives a group of physical writes one meaning.
+
+```text
+DBTX
+  │ translates one row operation into primary/index KV operations
+  ▼
+KVTX
+  │ privately collects the related KV operations
+  ▼
+Commit protocol
+  │ writes every ADD/DEL, then COMMIT, then calls fsync
+  ▼
+WAL
+  │ keeps the durable evidence needed for recovery
+  ▼
+MemTable
+  │ exposes recently committed values to current reads
+  ▼
+SSTables
+    keep merged committed data on disk
+```
+
+Each layer answers a different question:
+
+```text
+DBTX:         What logical row/table operation is being performed?
+KVTX:         Which physical KV changes belong to that operation?
+Commit marker: Did the complete group finish?
+WAL:          Which bytes can be recovered after a crash?
+MemTable:     Where can recent committed data be read quickly?
+SSTables:     How is older committed data stored persistently?
+```
+
+### Small indexed-row example
+
+Suppose this logical operation is requested:
+
+```text
+change user 10's city from LA to NY
+```
+
+The execution proceeds sequentially:
+
+```text
+1. DBTX understands the row update.
+
+2. DBTX translates it into physical KV changes:
+       DEL index(city=LA, user=10)
+       ADD primary(user=10, city=NY)
+       ADD index(city=NY, user=10)
+
+3. KVTX stages all three changes privately.
+   Other storage layers have not been changed yet.
+
+4. The outer KVTX commits them to the WAL:
+       DEL index(city=LA, user=10)
+       ADD primary(user=10, city=NY)
+       ADD index(city=NY, user=10)
+       COMMIT
+
+5. fsync makes the records and commit decision durable.
+
+6. Only after that succeeds, the changes are published to kv.mem.
+
+7. Later, normal flushing/compaction moves committed state into SSTables.
+```
+
+If the process crashes during step 4 before `COMMIT`, all three records belong
+to an incomplete transaction and recovery ignores them. If the durable marker
+exists, recovery restores all three—even if the crash happened during step 6
+before the MemTable was fully updated.
+
+This exposes the subtle difference:
+
+```text
+WAL:
+    Preserve what was written.
+
+Transaction protocol:
+    Decide whether the whole group counts.
+```
+
+Before 0805, the project had important pieces of ACID, especially durability,
+but not the full transaction contract:
+
+| Property | Before 0805 | What 0805 changes |
+| --- | --- | --- |
+| Atomicity | One physical record may be atomic; a group is not | Adds a recoverable commit boundary for the group |
+| Consistency | Application invariants can still be left half-updated | Atomic groups help preserve those invariants |
+| Isolation | Concurrent transactions are not isolated | Still future work |
+| Durability | WAL and synchronization preserve written records | The commit decision itself is now durable |
+
+## How the shared transaction explanation maps to this project
+
+The shared explanation has the right central model:
+
+- reliable storage is not automatically ACID;
+- WAL plus synchronization primarily supplies durability;
+- a transaction groups related writes behind one commit/abort decision;
+- recovery must reject a group that has no durable commit decision;
+- concurrency and visibility require additional machinery beyond atomic commit.
+
+Its examples then continue into transaction IDs, MVCC versions, snapshots,
+conflict detection, and isolation levels. Those are valid transaction concepts,
+but they are **future scope**, not what chapter 0805 implements.
+
+| Concept from the shared explanation | In 0805? | Where it belongs here |
+| --- | --- | --- |
+| Group several writes | Yes | `KVTX.updates` |
+| Commit or abort the whole group | Yes | `KVTX.Commit`, `Abort`, `EntryCommit` |
+| Ignore an incomplete group during recovery | Yes | Replay only through the last commit marker |
+| Statement atomicity inside a larger transaction | Yes | Nested `DBTX` and `KVTX` |
+| Transaction IDs | No | Unnecessary for this serialized local log design |
+| `TX_BEGIN` records | No | Transaction start is inferred from the previous commit boundary |
+| MVCC and snapshots | No | Later concurrency/isolation work |
+| Conflict detection and lost-update prevention | No | Later concurrency/isolation work |
+| Serializable execution | No | A stronger isolation guarantee, beyond 0805 |
+
+This distinction matters because **atomicity is about failure**, while
+**isolation is about concurrency**:
+
+```text
+Atomicity question:
+    A crash happens halfway through my own transaction. What survives?
+
+Isolation question:
+    Two transactions run at the same time. What may each one observe?
+```
+
+0805 answers the first question. Starting in 0901, the project begins addressing
+the second.
+
+### Why our log has no transaction ID or `BEGIN` record
+
+A general-purpose design may log records such as:
+
+```text
+TX_BEGIN 42
+TX_PUT   42 Alice=400
+TX_PUT   42 Bob=300
+TX_COMMIT 42
+```
+
+That representation can identify interleaved records from several active
+transactions. Our 0805 engine has a simpler constraint: one local writer emits
+one transaction's records contiguously. Therefore boundaries can be represented
+as:
+
+```text
+previous COMMIT | this transaction's ADD/DEL records | COMMIT
+                ▲                                      ▲
+                inferred start                         explicit end
+```
+
+The first transaction begins at byte offset zero; every later transaction
+begins just after the previous `EntryCommit`. Because transactions do not
+interleave in this log, adding IDs and `BEGIN` records would not improve the
+guarantee implemented in this chapter.
+
+## What the DDIA pages add to the mental model
+
+Kleppmann's pages 215–223 separate four ideas that are often bundled together
+under “transactions”:
+
+1. **Atomicity is abortability.** If a multi-write operation fails, its partial
+   effects can be discarded so the caller can safely treat it as unsuccessful.
+2. **Consistency is an application property.** The database provides tools such
+   as atomicity and isolation, but the application decides invariants such as
+   “money is neither created nor lost.”
+3. **Isolation concerns concurrent clients.** It is not supplied merely by
+   making one transaction crash-safe.
+4. **Durability starts after acknowledgement.** Once commit reports success,
+   the data must survive a crash; in this project that is why `fsync` must
+   succeed before `Commit` returns success.
+
+Pages 219–223 explain why multi-object atomicity is useful even when a database
+can already make one object atomic. One logical operation may update a primary
+record, foreign-key-related data, denormalized copies, counters, or secondary
+indexes. Our row-plus-secondary-index update is exactly this kind of
+multi-object operation.
+
+Pages 343–345 provide the closest match to our implementation. On one node,
+data records are made durable first and a commit record is appended afterward.
+During recovery, the presence of that marker determines whether the transaction
+is committed. The marker is therefore not decorative metadata: it is the
+irrevocable decision point.
+
+### Three different meanings of “the write succeeded”
+
+It helps to distinguish these moments:
+
+```text
+1. staged       update exists only in KVTX.updates
+2. recorded     ADD/DEL bytes were written, but no durable COMMIT exists
+3. committed    COMMIT and fsync succeeded
+4. published    committed updates were copied into kv.mem
+```
+
+- A staged write can be aborted normally.
+- A merely recorded write is still ignored after recovery.
+- A committed write must survive, even if the process crashes before publication
+  to the MemTable finishes.
+- Publication makes the current process see the result efficiently; the log is
+  what makes the result recoverable.
+
+This ordering explains why `updateLog` must finish before `updateMem`.
+
+### A caller can still be uncertain
+
+There is one subtle case worth remembering even though 0805 does not solve it:
+the commit marker and `fsync` may succeed, and then the process or connection may
+fail before the caller receives the success response. The database considers the
+transaction committed, while the caller does not know whether it committed.
+
+That is different from an incomplete transaction. Retrying safely may require an
+idempotency key or a way to query the result. The local commit marker solves
+storage recovery; it cannot guarantee delivery of the acknowledgement.
+
 ## Why 0804 is not enough
 
 Suppose changing one indexed row requires these physical KV updates:
@@ -512,9 +790,11 @@ It must never reconstruct a mixture of the two columns.
 | `kv_test.go` | Verify transaction recovery when the log is truncated or corrupted before commit. |
 | `table_test.go` | Continue verifying row/index behavior through the DB transaction interface. |
 
-The current `0805` directory was copied from 0804 and still uses the
-`db0804` package declaration. Before implementation, package declarations and
-tests should be aligned to `db0805`, matching `db_solution/0805`.
+The current `0805` directory was copied from 0804 and most files still use the
+`db0804` package declaration. All Go files in one directory must use the same
+package name, so source files and tests should be aligned together before the
+implementation is tested. The chapter number in the package name is
+organizational; changing it does not implement transaction atomicity.
 
 ## Recommended implementation order
 
