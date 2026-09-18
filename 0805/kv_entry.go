@@ -13,7 +13,7 @@
 // 0105: CRC32 checksum prepended for atomicity (13-byte header).
 // | crc32 | key size | val size | deleted | key data | val data |
 
-package db0804
+package db0805
 
 import (
 	"encoding/binary"
@@ -22,30 +22,37 @@ import (
 	"io"
 )
 
+type EntryOp uint8
+
+const (
+	EntryAdd    EntryOp = 0
+	EntryDel    EntryOp = 1
+	EntryCommit EntryOp = 2
+)
+
 type Entry struct {
 	key []byte
 	val []byte
 	// deleting a key in RAM was easy. However, on a phyiscal disk log,
 	// you cannot go back, find the key and delete as it only moves forward.
-	deleted bool
+	// deleted bool
+	op EntryOp
 }
 
 // 1. Serialization
 func (ent *Entry) Encode() []byte {
-	valLen := len(ent.val)
-	if ent.deleted {
-		valLen = 0
-	}
-	data := make([]byte, 4+4+4+1+len(ent.key)+valLen)
+	//  crc32 4B + keyLen 4B + value length 4B + op 1B + key data variable + val data variable
+	data := make([]byte, 4+4+4+1+len(ent.key)+len(ent.val))
+
+	data[4+4+4] = byte(ent.op)
+
 	binary.LittleEndian.PutUint32(data[4:8], uint32(len(ent.key)))
+	binary.LittleEndian.PutUint32(data[8:12], uint32(len(ent.val)))
 	copy(data[4+4+4+1:], ent.key)
-	if ent.deleted {
-		data[4+4+4] = 1
-	} else {
-		binary.LittleEndian.PutUint32(data[8:12], uint32(len(ent.val)))
-		copy(data[4+4+4+1+len(ent.key):], ent.val)
-	}
+	copy(data[4+4+4+1+len(ent.key):], ent.val)
+
 	binary.LittleEndian.PutUint32(data[0:4], crc32.ChecksumIEEE(data[4:]))
+
 	return data
 }
 
@@ -54,12 +61,13 @@ var ErrBadSum = errors.New("bad checksum")
 // 2. Deserialization
 func (ent *Entry) Decode(r io.Reader) error {
 	var header [4 + 4 + 4 + 1]byte
+
 	if _, err := io.ReadFull(r, header[:]); err != nil {
 		return err
 	}
 	klen := int(binary.LittleEndian.Uint32(header[4:8]))
 	vlen := int(binary.LittleEndian.Uint32(header[8:12]))
-	deleted := header[4+4+4]
+	op := EntryOp(header[4+4+4])
 
 	data := make([]byte, klen+vlen)
 	if _, err := io.ReadFull(r, data); err != nil {
@@ -74,11 +82,8 @@ func (ent *Entry) Decode(r io.Reader) error {
 	}
 
 	ent.key = data[:klen]
-	if deleted != 0 {
-		ent.deleted = true
-	} else {
-		ent.deleted = false
-		ent.val = data[klen:]
-	}
+	ent.val = data[klen:]
+	ent.op = op
+
 	return nil
 }

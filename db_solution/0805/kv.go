@@ -30,7 +30,9 @@ type KV struct {
 }
 
 type KVTX struct {
-	target  interface{ applyTX(*KVTX) error }
+	target  interface{ 
+		applyTX(*KVTX) error 
+	}
 	updates SortedArray
 	levels  MergedSortedKV
 }

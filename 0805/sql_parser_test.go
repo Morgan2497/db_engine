@@ -1,109 +1,11 @@
-package db0804
+package db0805
 
 import (
-	"fmt"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-// exprNodeLabel converts one expression node into a short label for test logs.
-func exprNodeLabel(expr interface{}) string {
-	switch node := expr.(type) {
-	case string:
-		return fmt.Sprintf("column %q", node)
-	case *Cell:
-		switch node.Type {
-		case TypeI64:
-			return fmt.Sprintf("integer %d", node.I64)
-		case TypeStr:
-			return fmt.Sprintf("string %q", node.Str)
-		default:
-			return fmt.Sprintf("cell(type=%d)", node.Type)
-		}
-	case *ExprBinOp:
-		switch node.op {
-		case OP_OR:
-			return "OR"
-		case OP_AND:
-			return "AND"
-		case OP_EQ:
-			return "="
-		case OP_NE:
-			return "!="
-		case OP_LE:
-			return "<="
-		case OP_GE:
-			return ">="
-		case OP_LT:
-			return "<"
-		case OP_GT:
-			return ">"
-		case OP_ADD:
-			return "+"
-		case OP_SUB:
-			return "-"
-		case OP_MUL:
-			return "*"
-		case OP_DIV:
-			return "/"
-		default:
-			return fmt.Sprintf("operator(%d)", node.op)
-		}
-	case *ExprUnOp:
-		switch node.op {
-		case OP_NOT:
-			return "NOT"
-		case OP_NEG:
-			return "-"
-		default:
-			return fmt.Sprintf("unary-operator(%d)", node.op)
-		}
-	case *ExprTuple:
-		return "TUPLE"
-	default:
-		return fmt.Sprintf("unknown(%T)", expr)
-	}
-}
-
-// appendExprTree recursively renders the children of an expression node.
-func appendExprTree(lines *[]string, expr interface{}, prefix, edge string, last bool) {
-	connector := "├──"
-	nextPrefix := prefix + "│   "
-	if last {
-		connector = "└──"
-		nextPrefix = prefix + "    "
-	}
-
-	*lines = append(*lines, fmt.Sprintf("%s%s %s: %s", prefix, connector, edge, exprNodeLabel(expr)))
-
-	switch node := expr.(type) {
-	case *ExprBinOp:
-		appendExprTree(lines, node.left, nextPrefix, "left", false)
-		appendExprTree(lines, node.right, nextPrefix, "right", true)
-	case *ExprUnOp:
-		appendExprTree(lines, node.kid, nextPrefix, "kid", true)
-	case *ExprTuple:
-		for i, child := range node.kids {
-			appendExprTree(lines, child, nextPrefix, fmt.Sprintf("kid[%d]", i), i == len(node.kids)-1)
-		}
-	}
-}
-
-// renderExprTree displays an expression's pointer-based tree in test logs.
-func renderExprTree(expr interface{}) string {
-	lines := []string{exprNodeLabel(expr)}
-	switch node := expr.(type) {
-	case *ExprBinOp:
-		appendExprTree(&lines, node.left, "", "left", false)
-		appendExprTree(&lines, node.right, "", "right", true)
-	case *ExprUnOp:
-		appendExprTree(&lines, node.kid, "", "kid", true)
-	}
-	return strings.Join(lines, "\n")
-}
 
 func TestParseName(t *testing.T) {
 	p := NewParser(" a b0 _0_ 123 ")
@@ -176,7 +78,7 @@ func TestParseStmt(t *testing.T) {
 	testParseStmt(t, s, stmt)
 
 	s = "create table t (a string, b int64, primary key (b));"
-	stmt = &StmtCreateTable{
+	stmt = &StmtCreatTable{
 		table: "t",
 		cols:  []Column{{"a", TypeStr}, {"b", TypeI64}},
 		pkey:  []string{"b"},
@@ -285,5 +187,4 @@ func TestParseExpr(t *testing.T) {
 					kid: "a"}}}}
 	testParseExpr(t, s, expr)
 }
-
 // QzBQWVJJOUhU https://trialofcode.org/

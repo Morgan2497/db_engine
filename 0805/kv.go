@@ -1,4 +1,4 @@
-package db0804
+package db0805
 
 import (
 	"bytes"
@@ -11,7 +11,7 @@ import (
 )
 
 type KVTX struct {
-	target  *KV
+	target  interface{ applyTX(*KVTX) error }
 	updates SortedArray
 	levels  MergedSortedKV
 }
@@ -45,12 +45,81 @@ func (kv *KV) NewTX() *KVTX {
 	return tx
 }
 
+func (tx *KVTX) NewTX() *KVTX {
+	inner := &KVTX{target: tx}
+
+	inner.levels = slices.Concat(
+		MergedSortedKV{&inner.updates},
+		tx.levels,
+	)
+	return inner
+}
+
 func (tx *KVTX) Seek(key []byte) (SortedKVIter, error) {
 	iter, err := tx.levels.Seek(key)
 	if err != nil {
 		return nil, err
 	}
 	return filterDeleted(iter)
+}
+
+func (tx *KVTX) Commit() error { return tx.target.applyTX(tx) }
+
+func (kv *KV) applyTX(tx *KVTX) error {
+	if err := kv.updateLog(tx); err != nil {
+		return err
+	}
+
+	kv.updateMem(tx)
+	return nil
+}
+
+func (kv *KV) updateLog(tx *KVTX) error {
+	defer kv.log.ResetTX()
+	iter, err := tx.updates.Iter()
+
+	for ; err == nil && iter.Valid(); err = iter.Next() {
+		op := EntryAdd
+		if iter.Deleted() {
+			op = EntryDel
+		}
+		err = kv.log.Write(&Entry{key: iter.Key(), val: iter.Val(), op: op})
+		if err != nil {
+			return err
+		}
+	}
+	check(err == nil)
+	return kv.log.Commit()
+}
+
+func (kv *KV) updateMem(tx *KVTX) {
+	iter, err := tx.updates.Iter()
+
+	for ; err == nil && iter.Valid(); err = iter.Next() {
+		if iter.Deleted() {
+			_, err = kv.mem.Del(iter.Key())
+		} else {
+			_, err = kv.mem.Set(iter.Key(), iter.Val())
+		}
+		check(err == nil)
+	}
+	check(err == nil)
+}
+
+func (tx *KVTX) applyTX(inner *KVTX) error {
+	iter, err := inner.updates.Iter()
+
+	for ; err == nil && iter.Valid(); err = iter.Next() {
+		if iter.Deleted() {
+			_, err = tx.updates.Del(iter.Key())
+		} else {
+			_, err = tx.updates.Set(iter.Key(), iter.Val())
+		}
+		check(err == nil)
+	}
+
+	check(err == nil)
+	return nil
 }
 
 func (tx *KVTX) Abort() {}
@@ -164,6 +233,7 @@ func (kv *KV) openLog() error {
 
 	kv.MultiClosers = append(kv.MultiClosers, &kv.log)
 
+	committed := 0
 	entries := []Entry{}
 	for {
 		ent := Entry{}
@@ -174,9 +244,20 @@ func (kv *KV) openLog() error {
 		if eof {
 			break
 		}
-		entries = append(entries, ent)
+
+		switch ent.op {
+		case EntryAdd, EntryDel:
+			entries = append(entries, ent)
+
+		case EntryCommit:
+			committed = len(entries)
+
+		default:
+			panic("unreachable")
+		}
 	}
 
+	entries = entries[:committed]
 	slices.SortStableFunc(entries, func(a, b Entry) int {
 		return bytes.Compare(a.key, b.key)
 	})
@@ -187,7 +268,8 @@ func (kv *KV) openLog() error {
 		if n > 0 && bytes.Equal(kv.mem.Key(n-1), ent.key) {
 			kv.mem.Pop()
 		}
-		kv.mem.Push(ent.key, ent.val, ent.deleted)
+		deleted := ent.op == EntryDel
+		kv.mem.Push(ent.key, ent.val, deleted)
 	}
 	return nil
 }
@@ -262,37 +344,23 @@ const (
 )
 
 func (kv *KV) SetEx(key []byte, val []byte, mode UpdateMode) (updated bool, err error) {
-	// 1. Look up the current state.
-	oldVal, exist, err := kv.Get(key)
+	tx := kv.NewTX()
+	updated, err = tx.SetEx(key, val, mode)
+	return abortOrCommit(tx, updated, err)
+}
+
+type TXLike interface {
+	Abort()
+	Commit() error
+}
+
+func abortOrCommit(tx TXLike, updated bool, err error) (bool, error) {
 	if err != nil {
-		return false, err
+		tx.Abort()
+	} else {
+		err = tx.Commit()
 	}
-
-	// 2. Eval. the write intent.
-	switch mode {
-	case ModeUpsert:
-		updated = !exist || !bytes.Equal(oldVal, val)
-	case ModeInsert:
-		updated = !exist
-	case ModeUpdate:
-		updated = exist && !bytes.Equal(oldVal, val)
-	default:
-		panic("unreachable")
-	}
-
-	// 3. Apply the mutation if the eval. passed.
-	if updated {
-		// This append-only log step is cruciall for crash recovery. If the server loses power,
-		// the data is not lost as the engine will simply read the log during the next Open()
-		// to reconstruct the state.
-		if err = kv.log.Write(&Entry{key: key, val: val}); err != nil {
-			return false, err
-		}
-
-		memUpdated, memErr := kv.mem.Set(key, val)
-		check(memErr == nil && memUpdated)
-	}
-	return updated, nil
+	return err == nil && updated, err
 }
 
 // Set stores a value. Reports true if the database state actually changed.
@@ -301,21 +369,9 @@ func (kv *KV) Set(key []byte, val []byte) (updated bool, err error) {
 }
 
 func (kv *KV) Del(key []byte) (deleted bool, err error) {
-	// Check the logical database: MemTable + SSTable.
-	if _, exist, err := kv.Get(key); err != nil || !exist {
-		return false, err
-	}
-
-	// Make the deletion durable first.
-	if err = kv.log.Write(&Entry{key: key, deleted: true}); err != nil {
-		return false, err
-	}
-
-	// Record the tombstone in the MemTable.
-	_, err = kv.mem.Del(key)
-	check(err == nil)
-
-	return true, nil
+	tx := kv.NewTX()
+	deleted, err = tx.Del(key)
+	return abortOrCommit(tx, deleted, err)
 }
 
 func (kv *KV) Seek(key []byte) (SortedKVIter, error) {
