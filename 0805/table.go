@@ -725,6 +725,7 @@ func (tx *DBTX) execUpdate(stmt *StmtUpdate) (count int, err error) {
 	}
 
 	oldRows := []Row{}
+
 	for ; err == nil && iter.Valid(); err = iter.Next() {
 		oldRows = append(oldRows, slices.Clone(iter.Row()))
 	}
@@ -1016,3 +1017,4 @@ func (db *DB) Range(schema *Schema, req *RangeReq) (*RowIterator, error) {
 	tx := db.NewTX()
 	return tx.Range(schema, req)
 }
+
