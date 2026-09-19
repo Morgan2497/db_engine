@@ -1,4 +1,4 @@
-package db0804
+package db0805
 
 import (
 	"bytes"
@@ -168,8 +168,14 @@ func TestKVRecovery(t *testing.T) {
 
 		updated, err := kv.Set([]byte("k1"), []byte("v1"))
 		assert.True(t, updated && err == nil)
-		updated, err = kv.Set([]byte("k2"), []byte("v2"))
+
+		tx := kv.NewTX()
+		updated, err = tx.Set([]byte("k3"), []byte("v3"))
 		assert.True(t, updated && err == nil)
+		updated, err = tx.Set([]byte("k2"), []byte("v2"))
+		assert.True(t, updated && err == nil)
+		err = tx.Commit()
+		require.Nil(t, err)
 	}
 
 	prepare()
@@ -185,6 +191,8 @@ func TestKVRecovery(t *testing.T) {
 	val, ok, err := kv.Get([]byte("k1"))
 	assert.True(t, string(val) == "v1" && ok && err == nil)
 	_, ok, err = kv.Get([]byte("k2")) // bad
+	assert.True(t, !ok && err == nil)
+	_, ok, err = kv.Get([]byte("k3")) // bad
 	assert.True(t, !ok && err == nil)
 	kv.Close()
 
@@ -202,6 +210,8 @@ func TestKVRecovery(t *testing.T) {
 	assert.True(t, string(val) == "v1" && ok && err == nil)
 	_, ok, err = kv.Get([]byte("k2")) // bad
 	assert.True(t, !ok && err == nil)
+	_, ok, err = kv.Get([]byte("k3")) // bad
+	assert.True(t, !ok && err == nil)
 	kv.Close()
 }
 
@@ -216,7 +226,7 @@ func TestEntryEncode(t *testing.T) {
 	assert.Nil(t, err)
 	assert.Equal(t, ent, decoded)
 
-	ent = Entry{key: []byte("k1"), deleted: true}
+	ent = Entry{key: []byte("k1"), val: []byte{}, op: EntryDel}
 	data = []byte{0x4c, 0xd0, 0xfe, 0xe5, 2, 0, 0, 0, 0, 0, 0, 0, 1, 'k', '1'}
 
 	assert.Equal(t, data, ent.Encode())

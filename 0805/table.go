@@ -1,4 +1,4 @@
-package db0804
+package db0805
 
 import (
 	"bytes"
@@ -13,8 +13,7 @@ type DBTX struct {
 }
 
 type DB struct {
-	KV     KV
-	tables map[string]Schema
+	KV KV
 }
 
 type SQLResult struct {
@@ -24,7 +23,7 @@ type SQLResult struct {
 }
 
 type RowIterator struct {
-	db      *DB
+	tx      *DBTX
 	schema  *Schema
 	indexNo int
 	iter    *RangedKVIter
@@ -88,6 +87,17 @@ func (tx *DBTX) Abort() {
 	tx.kv.Abort()
 }
 
+func (tx *DBTX) Commit() error {
+	return tx.kv.Commit()
+}
+
+func (tx *DBTX) NewTX() *DBTX {
+	return &DBTX{
+		kv:     tx.kv.NewTX(),
+		tables: make(map[string]Schema),
+	}
+}
+
 func suffixPositive(op ExprOp) bool {
 	switch op {
 	case OP_LE, OP_GT:
@@ -118,7 +128,10 @@ func isDescending(op ExprOp) bool {
 func (iter *RowIterator) Valid() bool { return iter.valid }
 
 // Current row accessor (Direct struct read in RAM)
-func (iter *RowIterator) Row() Row { return iter.row }
+func (iter *RowIterator) Row() Row {
+	check(iter.valid)
+	return iter.row
+}
 
 func (iter *RowIterator) Next() (err error) {
 	if err = iter.iter.Next(); err != nil {
@@ -152,7 +165,7 @@ func (iter *RowIterator) decodeKVIter() (bool, error) {
 	}
 
 	if iter.indexNo > 0 {
-		ok, err := iter.db.Select(iter.schema, iter.row)
+		ok, err := iter.tx.Select(iter.schema, iter.row)
 		if err != nil {
 			return false, err
 		}
@@ -188,31 +201,11 @@ func (tx *DBTX) Seek(schema *Schema, row Row) (*RowIterator, error) {
 	})
 }
 func (db *DB) Seek(schema *Schema, row Row) (*RowIterator, error) {
-	start := row.EncodeKey(schema, 0)
-
-	// table + 0x00 + 0xff sorts after every real key in this table.
-	stop := EncodeKeyPrefix(schema, 0, nil, true)
-
-	kvIter, err := db.KV.Range(start, stop, false)
-	if err != nil {
-		return nil, err
-	}
-
-	iter := &RowIterator{
-		schema: schema,
-		iter:   kvIter,
-		row:    schema.NewRow(),
-	}
-
-	iter.valid, err = iter.decodeKVIter()
-	if err != nil {
-		return nil, err
-	}
-	return iter, nil
+	tx := db.NewTX()
+	return tx.Seek(schema, row)
 }
 
 func (db *DB) Open() error {
-	db.tables = map[string]Schema{}
 	return db.KV.Open()
 }
 func (db *DB) Close() error { return db.KV.Close() }
@@ -226,13 +219,13 @@ myKV := KV{
     },
 }
 */
-func (db *DB) GetSchema(table string) (Schema, error) {
+func (tx *DBTX) GetSchema(table string) (Schema, error) {
 	// 1. Attempt to get the schema if exists in map (RAM cache first).
-	schema, ok := db.tables[table]
+	schema, ok := tx.tables[table]
 
 	if !ok {
 		// 1. Attempt durable read: fallback to the physical KV engine.
-		val, ok, err := db.KV.Get([]byte("@schema_" + table))
+		val, ok, err := tx.kv.Get([]byte("@schema_" + table))
 		if err == nil && ok {
 			err = json.Unmarshal(val, &schema)
 		}
@@ -242,9 +235,15 @@ func (db *DB) GetSchema(table string) (Schema, error) {
 		if !ok {
 			return Schema{}, errors.New("table is not found")
 		}
-		db.tables[table] = schema
+		tx.tables[table] = schema
 	}
 	return schema, nil
+}
+
+func (db *DB) GetSchema(table string) (Schema, error) {
+	tx := db.NewTX()
+	defer tx.Abort()
+	return tx.GetSchema(table)
 }
 
 func addPKeyToIndex(index []int, pkey []int) []int {
@@ -594,9 +593,9 @@ func fillNonPKey(schema *Schema, updates []NamedCell, out Row) error {
 
 // DDL: Data Definition Language.
 // It defines the physical rules of the database.
-func (db *DB) execCreateTable(stmt *StmtCreateTable) (err error) {
+func (tx *DBTX) execCreateTable(stmt *StmtCreateTable) (err error) {
 	// 0. Check if already exists.
-	if _, err := db.GetSchema(stmt.table); err == nil {
+	if _, err := tx.GetSchema(stmt.table); err == nil {
 		return errors.New("duplicate table name")
 	}
 
@@ -616,6 +615,9 @@ func (db *DB) execCreateTable(stmt *StmtCreateTable) (err error) {
 		}
 		schema.Indices = append(schema.Indices, index)
 	}
+	if len(schema.Indices) > 256 {
+		return errors.New("too many indices")
+	}
 
 	// 2. The JSON Serialization.
 	// Convert the Go struct into raw bytes for the KV store.
@@ -626,14 +628,14 @@ func (db *DB) execCreateTable(stmt *StmtCreateTable) (err error) {
 
 	// 3. Durable Write.
 	// Prefix the key so the storage engine knows this is metadata, not user data.
-	_, err = db.KV.Set([]byte("@schema_"+schema.Table), val)
+	_, err = tx.kv.Set([]byte("@schema_"+schema.Table), val)
 	if err != nil {
 		return err
 	}
 
 	// 4. The Cache Population.
 	// Make the schema instantly available in RAM for future queries.
-	db.tables[schema.Table] = schema
+	tx.tables[schema.Table] = schema
 
 	return nil
 }
@@ -641,21 +643,21 @@ func (db *DB) execCreateTable(stmt *StmtCreateTable) (err error) {
 // DQL (Data Query Language) pipeline.
 // Its job is to act as the ultimate translator between the user's abstract SQL string
 // and the physical hardware of the storage engine.
-func (db *DB) execCond(schema *Schema, cond interface{}) (*RowIterator, error) {
+func (tx *DBTX) execCond(schema *Schema, cond interface{}) (*RowIterator, error) {
 	req, err := makeRange(schema, cond)
 	if err != nil {
 		return nil, err
 	}
-	return db.Range(schema, req)
+	return tx.Range(schema, req)
 }
 
-func (db *DB) execSelect(stmt *StmtSelect) (output []Row, err error) {
-	schema, err := db.GetSchema(stmt.table)
+func (tx *DBTX) execSelect(stmt *StmtSelect) (output []Row, err error) {
+	schema, err := tx.GetSchema(stmt.table)
 	if err != nil {
 		return nil, err
 	}
 
-	iter, err := db.execCond(&schema, stmt.cond)
+	iter, err := tx.execCond(&schema, stmt.cond)
 	if err != nil {
 		return nil, err
 	}
@@ -680,9 +682,9 @@ func (db *DB) execSelect(stmt *StmtSelect) (output []Row, err error) {
 }
 
 // DML: Data Manipulation Language (DML): the memory translation.
-func (db *DB) execInsert(stmt *StmtInsert) (count int, err error) {
+func (tx *DBTX) execInsert(stmt *StmtInsert) (count int, err error) {
 	// 1. Fetch the metadata
-	schema, err := db.GetSchema(stmt.table)
+	schema, err := tx.GetSchema(stmt.table)
 	if err != nil {
 		return 0, err
 	}
@@ -700,7 +702,7 @@ func (db *DB) execInsert(stmt *StmtInsert) (count int, err error) {
 	}
 
 	// 4. Delegate to KV Store
-	inserted, err := db.Insert(&schema, stmt.value)
+	inserted, err := tx.Insert(&schema, stmt.value)
 	if err != nil {
 		return 0, err
 	}
@@ -711,18 +713,19 @@ func (db *DB) execInsert(stmt *StmtInsert) (count int, err error) {
 	return 0, nil
 }
 
-func (db *DB) execUpdate(stmt *StmtUpdate) (count int, err error) {
-	schema, err := db.GetSchema(stmt.table)
+func (tx *DBTX) execUpdate(stmt *StmtUpdate) (count int, err error) {
+	schema, err := tx.GetSchema(stmt.table)
 	if err != nil {
 		return 0, err
 	}
 
-	iter, err := db.execCond(&schema, stmt.cond)
+	iter, err := tx.execCond(&schema, stmt.cond)
 	if err != nil {
 		return 0, err
 	}
 
 	oldRows := []Row{}
+
 	for ; err == nil && iter.Valid(); err = iter.Next() {
 		oldRows = append(oldRows, slices.Clone(iter.Row()))
 	}
@@ -743,7 +746,7 @@ func (db *DB) execUpdate(stmt *StmtUpdate) (count int, err error) {
 			return 0, err
 		}
 
-		updated, updateErr := db.Update(&schema, row)
+		updated, updateErr := tx.Update(&schema, row)
 		if updateErr != nil {
 			return 0, updateErr
 		}
@@ -754,13 +757,13 @@ func (db *DB) execUpdate(stmt *StmtUpdate) (count int, err error) {
 	return count, nil
 }
 
-func (db *DB) execDelete(stmt *StmtDelete) (count int, err error) {
-	schema, err := db.GetSchema(stmt.table)
+func (tx *DBTX) execDelete(stmt *StmtDelete) (count int, err error) {
+	schema, err := tx.GetSchema(stmt.table)
 	if err != nil {
 		return 0, err
 	}
 
-	iter, err := db.execCond(&schema, stmt.cond)
+	iter, err := tx.execCond(&schema, stmt.cond)
 	if err != nil {
 		return 0, err
 	}
@@ -776,7 +779,7 @@ func (db *DB) execDelete(stmt *StmtDelete) (count int, err error) {
 	}
 
 	for _, row := range rows {
-		deleted, deleteErr := db.Delete(&schema, row)
+		deleted, deleteErr := tx.Delete(&schema, row)
 		if deleteErr != nil {
 			return 0, deleteErr
 		}
@@ -787,12 +790,21 @@ func (db *DB) execDelete(stmt *StmtDelete) (count int, err error) {
 
 	return count, nil
 }
+
 func (db *DB) Select(schema *Schema, row Row) (ok bool, err error) {
+	tx := db.NewTX()
+	defer tx.Abort()
+
+	return tx.Select(schema, row)
+}
+
+func (tx *DBTX) Select(schema *Schema, row Row) (ok bool, err error) {
 	// 1. We just encode the key.
 	key := row.EncodeKey(schema, 0)
 
 	// 2. Query the underlying storage engine.
-	val, ok, err := db.KV.Get(key)
+	val, ok, err := tx.kv.Get(key)
+
 	if err != nil || !ok {
 		return ok, err
 	}
@@ -804,11 +816,11 @@ func (db *DB) Select(schema *Schema, row Row) (ok bool, err error) {
 	return true, nil
 }
 
-func (db *DB) update(schema *Schema, row Row, mode UpdateMode) (updated bool, err error) {
+func (tx *DBTX) update(schema *Schema, row Row, mode UpdateMode) (updated bool, err error) {
 	key := row.EncodeKey(schema, 0)
 	val := row.EncodeVal(schema)
 
-	oldVal, exists, err := db.KV.Get(key)
+	oldVal, exists, err := tx.kv.Get(key)
 	if err != nil {
 		return false, err
 	}
@@ -833,7 +845,7 @@ func (db *DB) update(schema *Schema, row Row, mode UpdateMode) (updated bool, er
 		if err = oldRow.DecodeVal(schema, oldVal); err != nil {
 			return false, err
 		}
-		if _, err = db.Delete(schema, oldRow); err != nil {
+		if _, err = tx.delete(schema, oldRow); err != nil {
 			return false, err
 		}
 	}
@@ -843,7 +855,7 @@ func (db *DB) update(schema *Schema, row Row, mode UpdateMode) (updated bool, er
 			key = row.EncodeKey(schema, i)
 			val = nil
 		}
-		updated, err = db.KV.SetEx(key, val, ModeInsert)
+		updated, err = tx.kv.SetEx(key, val, ModeInsert)
 		if err == nil && !updated {
 			panic("impossible")
 		}
@@ -851,35 +863,59 @@ func (db *DB) update(schema *Schema, row Row, mode UpdateMode) (updated bool, er
 	return updated, err
 }
 
-func (db *DB) Insert(schema *Schema, row Row) (bool, error) {
-	return db.update(schema, row, ModeInsert)
+func (tx *DBTX) Insert(schema *Schema, row Row) (updated bool, err error) {
+	tx = tx.NewTX()
+	updated, err = tx.update(schema, row, ModeInsert)
+	return abortOrCommit(tx, updated, err)
 }
 
-func (db *DB) Upsert(schema *Schema, row Row) (bool, error) {
-	return db.update(schema, row, ModeUpsert)
+func (db *DB) Insert(schema *Schema, row Row) (updated bool, err error) {
+	tx := db.NewTX()
+	updated, err = tx.update(schema, row, ModeInsert)
+	return abortOrCommit(tx, updated, err)
 }
 
-func (db *DB) Update(schema *Schema, row Row) (bool, error) {
-	return db.update(schema, row, ModeUpdate)
+func (tx *DBTX) Upsert(schema *Schema, row Row) (updated bool, err error) {
+	tx = tx.NewTX()
+	updated, err = tx.update(schema, row, ModeUpsert)
+	return abortOrCommit(tx, updated, err)
 }
 
-func (db *DB) ExecStmt(stmt interface{}) (r SQLResult, err error) {
+func (tx *DBTX) Update(schema *Schema, row Row) (updated bool, err error) {
+	tx = tx.NewTX()
+	updated, err = tx.update(schema, row, ModeUpdate)
+	return abortOrCommit(tx, updated, err)
+}
+
+func (db *DB) Upsert(schema *Schema, row Row) (updated bool, err error) {
+	tx := db.NewTX()
+	updated, err = tx.update(schema, row, ModeUpsert)
+	return abortOrCommit(tx, updated, err)
+}
+
+func (db *DB) Update(schema *Schema, row Row) (updated bool, err error) {
+	tx := db.NewTX()
+	updated, err = tx.update(schema, row, ModeUpdate)
+	return abortOrCommit(tx, updated, err)
+}
+
+func (tx *DBTX) execStmt(stmt interface{}) (r SQLResult, err error) {
 	switch ptr := stmt.(type) {
 	case *StmtCreateTable:
-		err = db.execCreateTable(ptr)
+		err = tx.execCreateTable(ptr)
 
 	case *StmtSelect:
 		r.Header = ptr.cols
-		r.Values, err = db.execSelect(ptr)
+		r.Values, err = tx.execSelect(ptr)
 
 	case *StmtInsert:
-		r.Updated, err = db.execInsert(ptr)
+		r.Updated, err = tx.execInsert(ptr)
 
 	case *StmtUpdate:
-		r.Updated, err = db.execUpdate(ptr)
+		r.Updated, err = tx.execUpdate(ptr)
 
 	case *StmtDelete:
-		r.Updated, err = db.execDelete(ptr)
+		r.Updated, err = tx.execDelete(ptr)
 
 	default:
 		panic("unreachable")
@@ -887,10 +923,30 @@ func (db *DB) ExecStmt(stmt interface{}) (r SQLResult, err error) {
 	return r, err
 }
 
-func (db *DB) Delete(schema *Schema, row Row) (deleted bool, err error) {
+func (tx *DBTX) ExecStmt(stmt interface{}) (r SQLResult, err error) {
+	tx = tx.NewTX()
+	r, err = tx.execStmt(stmt)
+	if _, err = abortOrCommit(tx, true, err); err != nil {
+		return SQLResult{}, err
+	}
+	return r, nil
+}
+
+func (db *DB) ExecStmt(stmt interface{}) (r SQLResult, err error) {
+	tx := db.NewTX()
+	r, err = tx.execStmt(stmt)
+	if _, err = abortOrCommit(tx, true, err); err != nil {
+		return SQLResult{}, err
+	}
+	return r, nil
+}
+
+func (tx *DBTX) delete(schema *Schema, row Row) (deleted bool, err error) {
 	for i := 0; i < len(schema.Indices) && err == nil; i++ {
 		key := row.EncodeKey(schema, i)
-		deleted, err = db.KV.Del(key)
+
+		deleted, err = tx.kv.Del(key)
+
 		if err == nil && !deleted {
 			if i != 0 {
 				return false, errors.New("inconsistent index")
@@ -899,6 +955,22 @@ func (db *DB) Delete(schema *Schema, row Row) (deleted bool, err error) {
 		}
 	}
 	return deleted, err
+}
+
+func (tx *DBTX) Delete(schema *Schema, row Row) (deleted bool, err error) {
+	tx = tx.NewTX()
+
+	deleted, err = tx.delete(schema, row)
+
+	return abortOrCommit(tx, deleted, err)
+}
+
+func (db *DB) Delete(schema *Schema, row Row) (deleted bool, err error) {
+	tx := db.NewTX()
+
+	deleted, err = tx.delete(schema, row)
+
+	return abortOrCommit(tx, deleted, err)
 }
 
 func (tx *DBTX) Range(schema *Schema, req *RangeReq) (*RowIterator, error) {
@@ -926,6 +998,7 @@ func (tx *DBTX) Range(schema *Schema, req *RangeReq) (*RowIterator, error) {
 	}
 
 	iter := &RowIterator{
+		tx:      tx,
 		schema:  schema,
 		indexNo: req.IndexNo,
 		iter:    kvIter,
@@ -941,27 +1014,7 @@ func (tx *DBTX) Range(schema *Schema, req *RangeReq) (*RowIterator, error) {
 }
 
 func (db *DB) Range(schema *Schema, req *RangeReq) (*RowIterator, error) {
-	start := EncodeKeyPrefix(schema, req.IndexNo, req.Start, suffixPositive(req.StartCmp))
-	stop := EncodeKeyPrefix(schema, req.IndexNo, req.Stop, suffixPositive(req.StopCmp))
-	desc := isDescending(req.StartCmp)
-	kvIter, err := db.KV.Range(start, stop, desc)
-	if err != nil {
-		return nil, err
-	}
-
-	iter := &RowIterator{
-		db:      db,
-		schema:  schema,
-		indexNo: req.IndexNo,
-		iter:    kvIter,
-		row:     schema.NewRow(),
-	}
-
-	iter.valid, err = iter.decodeKVIter()
-
-	if err != nil {
-		return nil, err
-	}
-
-	return iter, nil
+	tx := db.NewTX()
+	return tx.Range(schema, req)
 }
+

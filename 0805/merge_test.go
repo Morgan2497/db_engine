@@ -1,4 +1,4 @@
-package db0804
+package db0805
 
 import (
 	"bytes"
@@ -36,7 +36,7 @@ func testMerge(t *testing.T, alist ...[]string) {
 				continue
 			}
 			dup[key] = true
-			expected = append(expected, Entry{k[i], v[i], false})
+			expected = append(expected, Entry{k[i], v[i], EntryAdd})
 		}
 	}
 
@@ -106,5 +106,4 @@ func TestMerge(t *testing.T) {
 	a, b = b, a
 	testMerge(t, a, b)
 }
-
 // QzBQWVJJOUhU https://trialofcode.org/
