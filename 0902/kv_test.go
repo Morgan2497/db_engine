@@ -1,4 +1,4 @@
-package db0901
+package db0902
 
 import (
 	"bytes"
@@ -343,5 +343,33 @@ func TestKVSnapshot(t *testing.T) {
 	val, ok, err = tx1.Get([]byte("k2"))
 	assert.True(t, string(val) == "v2" && ok && err == nil)
 	tx1.Abort()
+}
+
+func TestTXConflict(t *testing.T) {
+	kv := KV{}
+	kv.Options.Dirpath = "test_db"
+	defer os.RemoveAll(kv.Options.Dirpath)
+
+	os.RemoveAll(kv.Options.Dirpath)
+	err := kv.Open()
+	require.Nil(t, err)
+	defer kv.Close()
+
+	updated, err := kv.Set([]byte("k1"), []byte("v1"))
+	assert.True(t, updated && err == nil)
+
+	tx1, tx2 := kv.NewTX(), kv.NewTX()
+	updated, err = tx1.Set([]byte("k1"), []byte("x"))
+	assert.True(t, updated && err == nil)
+	updated, err = tx2.Set([]byte("k1"), []byte("y"))
+	assert.True(t, updated && err == nil)
+
+	err = tx1.Commit()
+	assert.Nil(t, err)
+	err = tx2.Commit()
+	assert.Equal(t, ErrTXConflict, err)
+
+	updated, err = kv.Set([]byte("k1"), []byte("z"))
+	assert.True(t, updated && err == nil)
 }
 // QzBQWVJJOUhU https://trialofcode.org/

@@ -13,7 +13,7 @@
 // 0105: CRC32 checksum prepended for atomicity (13-byte header).
 // | crc32 | key size | val size | deleted | key data | val data |
 
-package db0901
+package db0902
 
 import (
 	"encoding/binary"

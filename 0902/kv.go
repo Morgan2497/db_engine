@@ -1,4 +1,4 @@
-package db0901
+package db0902
 
 import (
 	"bytes"
@@ -11,7 +11,11 @@ import (
 )
 
 type KVTX struct {
-	target  interface{ applyTX(*KVTX) error }
+	snapshot uint64 // increases on a successful commit acting like a timestamp.
+	target   interface {
+		applyTX(*KVTX) error
+		abortTX(*KVTX)
+	}
 	updates SortedArray
 	levels  MergedSortedKV
 }
@@ -34,10 +38,21 @@ type KV struct {
 	mem  SortedArray  // MemTale: queryable recent changes.
 	main []SortedFile // SSTable: durable older database state.
 	MultiClosers
+	snapshot uint64
+	history  []UpdatedKey
+	ongoing  []*KVTX
 }
 
+type UpdatedKey struct {
+	snapshot uint64
+	key      []byte
+}
+
+var ErrTXConflict = errors.New("TX is conflict with another TX")
+
 func (kv *KV) NewTX() *KVTX {
-	tx := &KVTX{target: kv}
+	tx := &KVTX{snapshot: kv.snapshot, target: kv}
+	kv.ongoing = append(kv.ongoing, tx)
 
 	mem := kv.mem
 	tx.levels = MergedSortedKV{&tx.updates, &mem}
@@ -69,12 +84,36 @@ func (tx *KVTX) Seek(key []byte) (SortedKVIter, error) {
 func (tx *KVTX) Commit() error { return tx.target.applyTX(tx) }
 
 func (kv *KV) applyTX(tx *KVTX) error {
+	defer kv.untrackTX(tx)
+	if tx.updates.Size() == 0 {
+		return nil
+	}
+
+	if kv.checkTXConflict(tx) {
+		return ErrTXConflict
+	}
+
 	if err := kv.updateLog(tx); err != nil {
 		return err
 	}
 
 	kv.updateMem(tx)
+	kv.updateHistory(tx)
 	return nil
+}
+
+func (kv *KV) checkTXConflict(tx *KVTX) bool {
+	iter, err := tx.updates.Iter()
+	for ; err == nil && iter.Valid(); err = iter.Next() {
+		key := iter.Key()
+		for _, other := range kv.history {
+			if other.snapshot > tx.snapshot && bytes.Equal(other.key, key) {
+				return true
+			}
+		}
+	}
+	check(err == nil)
+	return false
 }
 
 func (kv *KV) updateLog(tx *KVTX) error {
@@ -98,7 +137,7 @@ func (kv *KV) updateLog(tx *KVTX) error {
 func (kv *KV) updateMem(tx *KVTX) {
 	// 1. Allocate a fresh destination
 	merged := SortedArray{}
-	
+
 	// 2. Merge tx.updates over the current kv.mem.
 	// tx.updates has priority when both levels contain the same key.
 	iter, err := MergedSortedKV{&tx.updates, &kv.mem}.Iter()
@@ -113,6 +152,20 @@ func (kv *KV) updateMem(tx *KVTX) {
 	kv.mem = merged
 }
 
+func (kv *KV) updateHistory(tx *KVTX) {
+	kv.snapshot++
+
+	if len(kv.ongoing) > 1 {
+		iter, err := tx.updates.Iter()
+		for ; err == nil && iter.Valid(); err = iter.Next() {
+			kv.history = append(kv.history, UpdatedKey{
+				snapshot: kv.snapshot,
+				key:      iter.Key(),
+			})
+		}
+		check(err == nil)
+	}
+}
 func (tx *KVTX) applyTX(inner *KVTX) error {
 	iter, err := inner.updates.Iter()
 
@@ -129,7 +182,29 @@ func (tx *KVTX) applyTX(inner *KVTX) error {
 	return nil
 }
 
-func (tx *KVTX) Abort() {}
+func (tx *KVTX) Abort() { tx.target.abortTX(tx) }
+
+func (kv *KV) abortTX(tx *KVTX) { kv.untrackTX(tx) }
+
+func (tx *KVTX) abortTX(inner *KVTX) {
+	// Nested transactions are not tracked in kv.ongoing
+	// Aborting a child must not untrack its parent.
+}
+
+func (kv *KV) untrackTX(tx *KVTX) {
+	idx := slices.Index(kv.ongoing, tx)
+	kv.ongoing = slices.Delete(kv.ongoing, idx, idx+1)
+
+	if len(kv.ongoing) == 0 {
+		kv.history = kv.history[:0]
+		return
+	}
+
+	oldest := kv.ongoing[0].snapshot
+	for len(kv.history) > 0 && kv.history[0].snapshot < oldest {
+		kv.history = kv.history[1:]
+	}
+}
 
 func (tx *KVTX) Get(key []byte) (val []byte, ok bool, err error) {
 	iter, err := tx.Seek(key)
