@@ -1,4 +1,4 @@
-package db0902
+package db0903
 
 import (
 	"bytes"
@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"slices"
+	"sync"
 )
 
 type KVTX struct {
@@ -37,10 +38,17 @@ type KV struct {
 	log  Log          // WAL: durable recent-write history.
 	mem  SortedArray  // MemTale: queryable recent changes.
 	main []SortedFile // SSTable: durable older database state.
-	MultiClosers
+
+	// synchronization
+	mu sync.Mutex
+	commit sync.Mutex
+
+	// transactions
 	snapshot uint64
 	history  []UpdatedKey
 	ongoing  []*KVTX
+
+	MultiClosers
 }
 
 type UpdatedKey struct {
@@ -51,6 +59,9 @@ type UpdatedKey struct {
 var ErrTXConflict = errors.New("TX is conflict with another TX")
 
 func (kv *KV) NewTX() *KVTX {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
 	tx := &KVTX{snapshot: kv.snapshot, target: kv}
 	kv.ongoing = append(kv.ongoing, tx)
 
@@ -83,8 +94,28 @@ func (tx *KVTX) Seek(key []byte) (SortedKVIter, error) {
 
 func (tx *KVTX) Commit() error { return tx.target.applyTX(tx) }
 
+func (kv *KV) untrackTXSync(tx *KVTX) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	idx := slices.Index(kv.ongoing, tx)
+	kv.ongoing = slices.Delete(kv.ongoing, idx, idx+1)
+	if len(kv.ongoing) > 0 {
+		oldest := kv.ongoing[0].snapshot
+
+		for len(kv.history) > 0 && kv.history[0].snapshot < oldest {
+			kv.history = kv.history[1:]
+		}
+	} else {
+		kv.history = kv.history[:0]
+	}
+}
+
 func (kv *KV) applyTX(tx *KVTX) error {
-	defer kv.untrackTX(tx)
+	kv.commit.Lock()
+	defer kv.commit.Unlock()
+	defer kv.untrackTXSync(tx)
+
 	if tx.updates.Size() == 0 {
 		return nil
 	}
@@ -97,6 +128,8 @@ func (kv *KV) applyTX(tx *KVTX) error {
 		return err
 	}
 
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
 	kv.updateMem(tx)
 	kv.updateHistory(tx)
 	return nil
@@ -184,26 +217,11 @@ func (tx *KVTX) applyTX(inner *KVTX) error {
 
 func (tx *KVTX) Abort() { tx.target.abortTX(tx) }
 
-func (kv *KV) abortTX(tx *KVTX) { kv.untrackTX(tx) }
+func (kv *KV) abortTX(tx *KVTX) { kv.untrackTXSync(tx) }
 
 func (tx *KVTX) abortTX(inner *KVTX) {
 	// Nested transactions are not tracked in kv.ongoing
 	// Aborting a child must not untrack its parent.
-}
-
-func (kv *KV) untrackTX(tx *KVTX) {
-	idx := slices.Index(kv.ongoing, tx)
-	kv.ongoing = slices.Delete(kv.ongoing, idx, idx+1)
-
-	if len(kv.ongoing) == 0 {
-		kv.history = kv.history[:0]
-		return
-	}
-
-	oldest := kv.ongoing[0].snapshot
-	for len(kv.history) > 0 && kv.history[0].snapshot < oldest {
-		kv.history = kv.history[1:]
-	}
 }
 
 func (tx *KVTX) Get(key []byte) (val []byte, ok bool, err error) {
