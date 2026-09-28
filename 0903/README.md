@@ -76,43 +76,116 @@ Without coordination, operations on these fields can overlap in unsafe ways.
 
 ### Race 1: transaction start versus commit publication
 
-`NewTX` must capture the MemTable version and the matching commit timestamp.
-Imagine a writer publishes a new MemTable between those two reads:
+Think of a transaction's starting snapshot as a pair:
 
 ```text
-Writer:       old state (M0, timestamp 7)
-Reader:       captures timestamp 7
-Writer:       publishes M1, timestamp 8
-Reader:       captures M1
+commit number: 7
+data version:  M0, where k1=10
 ```
 
-The reader now has `(M1, 7)`, a pair that never represented one committed version.
-Its data view and conflict-check timestamp disagree. `NewTX` must read the pair and
-register the transaction while publication is excluded.
+In the 0902 code, `NewTX` copies the number and the MemTable in separate steps:
+
+```go
+tx := &KVTX{snapshot: kv.snapshot, target: kv} // copy the number
+kv.ongoing = append(kv.ongoing, tx)
+mem := kv.mem                                   // copy the data view
+```
+
+Now imagine another goroutine commits **between** those copies:
+
+```text
+1. NewTX copies the number: 7.
+2. Writer commits: number becomes 8; MemTable becomes M1 with k1=20.
+3. NewTX copies the MemTable: M1 with k1=20.
+```
+
+The new transaction has `(number 7, data M1)`. That pair never described one
+committed state:
+
+```text
+Before writer's commit: (7, M0 with k1=10)
+After writer's commit:  (8, M1 with k1=20)
+Accidental combination: (7, M1 with k1=20)
+```
+
+The number tells 0902's conflict checker which commits are newer than the
+transaction. The MemTable tells the transaction what data it saw. If the two
+disagree, a transaction that read `k1=20` can later be treated as if the commit
+that produced `20` happened after it started.
+
+In 0903, `NewTX` holds `kv.mu` while copying both parts and registering the
+transaction. The writer takes the same mutex while publishing the new MemTable
+and number. Thus, `NewTX` captures either `(7, M0)` or `(8, M1)`; the writer cannot
+publish halfway through that capture.
 
 ### Race 2: two commits sharing the WAL
 
-`updateLog` writes multiple entries and a commit marker. If two transactions write
-to the same log concurrently, their records can interleave:
+The WAL uses one shared `Log`. `updateLog` writes each transaction's entries and
+then calls `Log.Commit`, which appends an `EntryCommit` marker and syncs the file.
+That marker has **no transaction ID**. During recovery, `openLog` treats all
+entries before the last commit marker as committed.
+
+Suppose transaction A stages `a=1` and transaction B stages `b=1`. Without a lock,
+their calls can interleave like this:
 
 ```text
-Wanted:
-    A1, A2, commit-A, B1, B2, commit-B
-
-Possible without serialized writers:
-    A1, B1, A2, commit-B, B2, commit-A
+1. A writes its entry:       [a=1]
+2. B writes its entry:       [a=1, b=1]
+3. A writes a commit marker: [a=1, b=1, COMMIT]
+4. Power fails before B calls Log.Commit.
 ```
 
-The second sequence does not preserve the intended transaction boundaries.
-Competing commits need one defined order through validation, WAL writing, and
-publication.
+A intended to commit only `a=1`. B never committed. But recovery reads both
+entries before the marker:
+
+```text
+Log on restart: [a=1, b=1, COMMIT]
+Recovery result: a=1 and b=1
+```
+
+Thus, B's uncommitted update could be restored as if it had committed. The
+shared `log.writer.offset` and `log.writer.committed` fields also require ordered
+access; simultaneous writes could otherwise race over file positions.
+
+In 0903, `kv.commit` lets only one top-level commit use the WAL at a time:
+
+```text
+A holds kv.commit: write a=1 → COMMIT → sync → publish A → release
+B waits, then:    write b=1 → COMMIT → sync → publish B → release
+```
+
+The log now has clear boundaries: `[a=1, COMMIT] [b=1, COMMIT]`. If power fails
+before B's marker, recovery stops at A's marker and does not restore B's update.
 
 ### Race 3: active transactions and history
 
-`NewTX` appends to `kv.ongoing`; commit and abort remove from it. A commit may append
-to `kv.history`, while a finishing transaction may prune that slice. Go slices are
-not automatically safe for simultaneous reads and writes. A mutex must protect the
-shared operations.
+`kv.ongoing` is the list of transactions that still need their snapshots. Imagine
+it starts as `[A]`. Now B begins at the same time that A aborts:
+
+```text
+Initial state:       kv.ongoing = [A]
+B calls NewTX:       append B       → should become [A, B]
+A calls Abort:       remove A       → should become [B]
+```
+
+If these operations run without coordination, both goroutines may read and modify
+the same Go slice concurrently. One might publish a slice based on stale state,
+losing B or leaving A in the list. The exact result is not predictable; the
+important point is that a slice is not a concurrent transaction registry.
+
+With `kv.mu`, the operations run one at a time. If B goes first, `[A] → [A, B]
+→ [B]`. If A goes first, `[A] → [] → [B]`. Either way the final active list is
+`[B]`.
+
+Why does this matter beyond the list itself? `untrackTX` uses the oldest active
+snapshot to decide which entries in `kv.history` can be discarded. If B is lost
+from `kv.ongoing`, history needed to check B's future write conflicts may be
+pruned too early. If A remains after aborting, old history may be retained
+unnecessarily. Commits also append to `kv.history`, so updates and pruning of
+that slice need coordination. The chapter's solution protects those writes with
+`kv.mu`, but its conflict check reads history while holding only `kv.commit`;
+a concurrent abort can still prune history. That remaining race is not a
+guarantee of fully safe multithreading.
 
 ### Race 4: exposing a partly published commit
 
@@ -153,6 +226,37 @@ The code from `Lock()` until `Unlock()` is the **critical section**.
 The mutex works only when all access paths follow the same locking rule. Protecting
 one writer but leaving another writer or reader unprotected does not make a field
 safe.
+
+### Lock, mutex, and semaphore: what is the difference?
+
+**Lock** is a broad term for a rule that controls access to something shared.
+A **mutex** (mutual exclusion) is a specific lock: only **one** goroutine may
+enter its critical section at a time. A **semaphore** holds a number of permits:
+up to **N** goroutines may proceed at once.
+
+| Mechanism | With five goroutines trying to enter | Useful when |
+|---|---|---|
+| Mutex | One enters; four wait | Operations must not overlap while using shared state |
+| Semaphore with three permits | Three enter; two wait | Some overlap is fine, but concurrency must be limited |
+
+Picture a mutex as one key to a room and a semaphore as a box containing N
+tickets. Taking a ticket grants permission to proceed; returning it lets someone
+else proceed. A one-permit semaphore may look like a mutex, but a mutex expresses
+exclusive access to a critical section, while a semaphore expresses available
+capacity.
+
+For this chapter, `kv.mu` and `kv.commit` are **both mutexes**, not semaphores.
+For example, `kv.mu` must keep a writer publishing `(snapshot 8, M1)` from
+overlapping with `NewTX` capturing that pair. Allowing two goroutines into this
+critical section would not prevent the mixed `(snapshot 7, M1)` state. A
+semaphore could instead limit an independent task, such as running at most three
+compaction jobs concurrently, but it would **not** automatically make shared
+MemTable updates safe.
+
+The practical question is: **Must these operations never overlap?** Use a mutex.
+**May up to N operations overlap?** Use a semaphore. Neither mechanism helps if
+code bypasses the access rule, and neither is the same as a database row lock
+held for a transaction's lifetime.
 
 ## What is actually locked?
 
