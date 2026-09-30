@@ -1,377 +1,300 @@
-# Chapter 0904: Multithread & Channels
+# Multithreading and channels in a database engine
 
-Chapter 0903 used mutexes to protect transaction state and to order commits. Chapter
-0904 adds **automatic background compaction**. A successful commit tells a worker
-goroutine that there may be storage maintenance to do. The worker sleeps when there
-is no signal, runs `KV.Compact()` when signaled, and exits during shutdown.
+Chapter 0904 uses background compaction to introduce concurrency. The ideas are
+broader than this chapter: whenever a database accepts writes while doing
+maintenance, several activities must share resources without corrupting state
+or waiting forever. This guide explains the concepts, using our WAL, MemTable,
+and SSTables as examples.
 
-The central problem is coordinating three activities that can overlap:
+“Thread” in the book often means a **goroutine** in Go. The Go runtime schedules
+goroutines onto operating-system threads. Whether they run on different cores
+or take turns on one core, their operations can overlap in unpredictable ways.
+
+## The database situation
+
+A write follows this path:
 
 ```text
-transaction goroutines: commit new data to the WAL and MemTable
-compaction goroutine:   turn the MemTable into an SSTable, merge SSTables
-closing goroutine:      stop new work and wait before closing files
+client write → transaction commit → durable WAL → current MemTable
 ```
 
-This chapter is about *in-process concurrency*. A Go channel here is an in-memory
-communication mechanism between goroutines. DDIA also discusses message queues
-between processes; the comparison is useful, but the durability and delivery
-guarantees are different.
+The WAL lets the database recover committed writes after a crash. The MemTable
+lets it find them quickly. Eventually the MemTable is written to an SSTable,
+and older SSTables are merged. This maintenance is **compaction**.
 
-## Reading map
+If every client write also performed all necessary compaction, a slow merge
+could make that request very slow. A background worker separates the two jobs:
 
-| Source | Where | Why it matters here |
+```text
+client goroutine:  commit write ── notify worker ── return
+worker goroutine:                    wake ── inspect state ── compact if needed
+```
+
+Background does not mean unimportant. Without compaction, the WAL and SSTable
+collection can grow, and reads may inspect more files. The challenge is to let
+the worker overlap with transactions safely.
+
+Martin Kleppmann describes this storage pattern in *Designing Data-Intensive
+Applications* (DDIA), Chapter 3, printed pp. 71–76. Old, immutable segments
+can keep serving readers while a new merged segment is built. The database
+then publishes the replacement. The distinction between **building** a new
+version and **making it visible** is central to concurrent database work.
+
+## What “concurrent” means here
+
+Imagine a transaction committing while compaction reads the MemTable. We
+cannot assume a neat execution order. If compaction truncates a WAL entry it
+did not include in the SSTable, recovery may lose a write. If a transaction
+sees a partially changed SSTable list, it may read an incoherent version.
+
+Two separate questions arise:
+
+| Question | Database example | Coordination |
 |---|---|---|
-| *Build Your Own Database From Scratch in Go* | 0904, printed pp. 99–103 | Auto-compaction, channels, `select`, shutdown, and `WaitGroup` |
-| Martin Kleppmann, *Designing Data-Intensive Applications* (DDIA) | Ch. 3, “Data Structures That Power Your Database,” printed pp. 71–76 | Immutable segments, MemTable flush, SSTable merge, background compaction, WAL |
-| DDIA | Ch. 4, “Message passing data flow,” pp. 132–134 | Why a queue separates a sender from a receiver; distinction between messages and calls |
-| DDIA | Ch. 11, “Transmitting Event Streams,” p. 427 | Buffering versus backpressure when producers outrun a consumer |
+| Can two operations use shared state at once? | Commit and compaction both use the WAL. | Mutex or ownership rule |
+| When should another activity run? | A commit makes maintenance worth checking. | Channel notification |
 
-Local source files: [0904 reference `kv.go`](../db_solution/0904/kv.go),
-[0904 reference tests](../db_solution/0904/kv_test.go), and the
-[0903 notes](../0903/README.md). The book PDFs are
-[`db_in_45_steps_go.pdf`](/home/morgankim/Documents/ebooks/db_in_45_steps_go.pdf)
-and [DDIA](/home/morgankim/Documents/ebooks/Martin-Kleppmann---Designing-Data-Intensive-Applications_-O’Reilly-Media-(2017).pdf).
+A channel does not automatically protect the MemTable. A mutex does not
+automatically wake a sleeping worker. We use both because they answer
+different questions.
 
-## Why compaction belongs in a worker
+### Data races and logical mistakes
 
-The engine accepts writes into a MemTable and records them in a write-ahead log
-(WAL). The MemTable cannot grow forever. Once it is large enough, `compactLog`
-writes its sorted contents to an SSTable and truncates the now-obsolete log. Older
-SSTables must occasionally be merged so reads do not have to search an ever-growing
-list of files.
+A **data race** occurs when goroutines access the same memory concurrently,
+at least one access writes it, and nothing synchronizes them. For example,
+one goroutine could replace the `main` SSTable slice while another reads its
+length. Go's race detector helps find data races that a test actually runs.
 
-DDIA's LSM-tree description follows the same cycle: append a durable log entry,
-update an in-memory sorted structure, flush that structure to an immutable SSTable,
-and merge SSTables in the background. Readers can keep using old immutable files
-while a new merged file is built; the engine then switches to the new file. Chapter
-0904 turns the earlier explicit `KV.Compact()` call into work triggered after commits.
+There is also a higher-level problem: individual memory accesses might be
+synchronized, yet the overall storage operation may still be wrong. Suppose
+compaction reads a MemTable snapshot, a new write commits, and compaction
+truncates the WAL as though its snapshot included that write. The issue is
+the **ordering of actions**, including durability and publication. Reason
+about invariants such as: every committed WAL entry is either still in the
+WAL or represented by a published SSTable.
+
+## A channel communicates an event
+
+A Go channel lets one goroutine send a value and another receive it. If no
+value is ready, the receiver waits without repeatedly checking in a busy
+loop. This lets a worker sleep until there may be work.
+
+```go
+updated := make(chan struct{}, 2)
+updated <- struct{}{} // commit: "check whether compaction is needed"
+<-updated             // worker wakes
+```
+
+`struct{}` has no payload. The sender communicates an **event**, not the
+committed rows. The worker reads current storage state and decides what to
+do. If ten commits occur before it runs, it may observe all ten changes in
+one check. One notification does not mean one SSTable.
+
+The durable record of a write is the WAL, not the channel value. A Go channel
+lives in process memory and disappears on crash. After restart, the database
+replays the WAL; it does not replay channel notifications. Losing a maintenance
+hint may delay compaction, but must not lose committed user data.
+
+This is a general distinction: a message can mean “perform this specific
+job” or “something changed; inspect the source of truth.” Our notification
+means the latter.
+
+### Sending, receiving, and capacity
+
+| Channel state | Send | Receive |
+|---|---|---|
+| Unbuffered, no partner ready | Waits | Waits |
+| Buffered, room available | Enqueues and continues | Takes a value if present |
+| Buffered, full | Waits for room | Takes a value and frees room |
+| Buffered, empty | Enqueues if sent | Waits for a value |
+| Closed and drained | Panics | Returns zero value with `ok == false` |
+| Nil | Waits forever | Waits forever |
+
+With an **unbuffered** channel, sender and receiver meet at the same time.
+With a **buffered** channel, the sender can get ahead by at most the buffer
+capacity. Receiving frees a slot; it does **not** mean the worker finished
+compaction. A closed buffered channel yields its remaining values before
+receives return `ok == false`. Closing it twice panics.
+
+## Backpressure: when writes outrun maintenance
+
+Suppose commits produce signals faster than the worker receives them. A
+finite buffer eventually fills. The next send waits, delaying that commit
+call. This is **backpressure**: slow downstream work pushes waiting time
+toward producers.
+
+DDIA discusses the same choice for event streams in Chapter 11, printed
+p. 427: buffer messages, drop them, or block producers. A bounded channel
+buffers a burst and then blocks senders.
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| Larger buffer | More bursts finish without waiting. | More queued signals before pressure reaches writers. |
+| Smaller buffer | Pressure reaches writers sooner. | More commits wait during ordinary bursts. |
+| Drop or coalesce signals | Avoids a growing notification queue. | Requires another reliable way to notice outstanding maintenance. |
+
+In the reference engine, the buffer capacity is `LogShreshold` (the book's
+spelling), and each successful top-level commit sends a signal, even if it
+was read-only. Buffer occupancy is **not** the number of MemTable keys or a
+hard upper bound on WAL size. Repeated updates to one key can make many
+signals, and the worker removes a signal before compaction finishes.
+
+Backpressure is observable as write latency. The key questions are whether
+waiting preserves progress and whether the chosen limit matches the resource
+being protected.
+
+## How a channel and a lock can deadlock
+
+A send may block; acquiring a mutex may also block. These waits can form a
+cycle:
 
 ```text
-commit:     WAL commit → publish MemTable → signal updated → return
-worker:                                             wake → Compact()
-                                                      ├─ flush MemTable if large
-                                                      └─ merge an eligible SSTable pair
+commit holds WAL lock
+    ↓ waits to send because signal buffer is full
+worker needs to receive more signals to free space
+    ↓ waits for WAL lock to compact
+commit still holds WAL lock
 ```
 
-The signal does **not** contain a key, value, or snapshot. Compaction inspects the
-current database state when it runs. The WAL already holds the durable updates;
-the channel is only a request to check whether maintenance is due. If a signal is
-discarded during shutdown, that does not discard the committed data: `Open()` can
-recover it from the WAL. It may leave compaction work for a later session.
+Neither side can do what the other needs. That is a **deadlock**. The general
+method is to trace the entire wait chain whenever a goroutine can block
+while holding a resource another goroutine needs.
 
-## Goroutines, threads, locks, and channels
+In 0904, a commit finishes its protected WAL and publication work before
+sending the signal. The send can still wait on a full buffer, but it no
+longer holds the WAL lock needed by the worker. That keeps backpressure
+without this particular deadlock.
 
-The book often says “thread.” The code starts a Go **goroutine** with `go func()`;
-the Go runtime schedules goroutines onto operating-system threads. You should
-reason about possible interleavings, regardless of how many cores execute them.
+Healthy backpressure means the worker can eventually run and free a slot.
+Deadlock means the worker cannot run because the waiting sender holds a
+resource it needs.
 
-The two synchronization tools have different jobs:
+## `select`: respond to work or shutdown
 
-| Tool | What it coordinates in 0904 |
-|---|---|
-| `kv.commit` mutex | Gives WAL commits and log compaction an exclusive order |
-| `kv.mu` mutex | Protects short in-memory publication of the MemTable, SSTable list, and transaction bookkeeping |
-| `kv.updated` channel | Sends a wake-up signal from commits to the compaction worker |
-| `kv.closing` channel | Broadcasts that the database is closing |
-| `kv.threads` `WaitGroup` | Waits for tracked transactions and the worker to finish |
-
-A channel send does not grant exclusive access to the database. `Compact()` still
-needs appropriate locks around shared state. Conversely, mutexes alone do not tell
-a sleeping worker *when* to run.
-
-## A channel, one operation at a time
-
-Create a channel with `make(chan T, capacity)`. Send with `c <- value`; receive
-with `value := <-c`.
-
-```go
-work := make(chan string, 2)
-work <- "A"
-work <- "B"
-item := <-work // "A"; the receive frees one buffer slot
-```
-
-A buffered channel holds at most `capacity` pending values. A send to a full
-buffer waits until a receiver removes a value. A receive from an empty channel
-waits until a sender provides one. Waiting parks the goroutine; it does not require
-a CPU-burning polling loop. With capacity zero, a send and receive rendezvous:
-both sides must be ready at the same time.
-
-For a signal with no payload, `chan struct{}` expresses the intent:
-
-```go
-updated := make(chan struct{}, 1000)
-updated <- struct{}{} // "check whether compaction is needed"
-<-updated             // wake and check
-```
-
-`struct{}{}` carries no data. The buffer still contains **one slot per signal**.
-The reference implementation makes its capacity `LogShreshold` (the book and code
-spell it this way). That setting limits pending notifications; it is not a byte
-limit on the WAL or a guarantee that the MemTable has exactly that many entries.
-For example, repeated commits to one key may enqueue many signals while leaving
-only one current key in the MemTable.
-
-### Closing and nil are different states
-
-Receiving from a closed, drained channel returns the element type's zero value
-and `ok == false`:
-
-```go
-v, ok := <-work
-if !ok {
-    // No more values will arrive.
-}
-```
-
-Buffered values are received first; `ok` becomes false after the buffer drains.
-Sending to a closed channel panics. Closing a channel a second time also panics.
-The party that controls the end of sending normally closes it.
-
-A channel's zero value is `nil`. Both send and receive on a nil channel block
-forever. There is no hidden queue to wake them later. In this chapter, `Open()`
-initializes `closing`, and `startCompactThread()` initializes `updated` when
-`AutoCompact` is enabled.
-
-## Follow one successful write
-
-The 0904 solution splits the commit into `applyTXSync` and `applyTX`:
-
-```go
-func (kv *KV) applyTX(tx *KVTX) error {
-    if err := kv.applyTXSync(tx); err != nil {
-        return err
-    }
-    if kv.Options.AutoCompact {
-        select {
-        case kv.updated <- struct{}{}:
-        case <-kv.closing:
-        }
-    }
-    return nil
-}
-```
-
-`applyTXSync` takes `kv.commit`, validates the transaction, writes the WAL, and
-publishes the new MemTable while holding `kv.mu`. It returns **after releasing
-the locks**. Only then does `applyTX` try to send a notification. The worker
-receives a notification and calls `KV.Compact()`; `Compact()` checks current
-thresholds rather than assuming that every signal requires a flush.
-
-An important detail: the shown `applyTX` signals after any successful top-level
-`applyTXSync`, including a read-only transaction whose update set was empty.
-That can cause an extra no-op check. A failed or conflicting commit returns
-without signaling.
-
-### Why the send must happen after unlocking
-
-Imagine putting a blocking channel send inside the `kv.commit` critical section.
-Suppose the channel buffer is full:
-
-```text
-writer: holds kv.commit → tries to send → waits for buffer space
-worker: received earlier signal → enters Compact → waits for kv.commit
-```
-
-The worker must finish work to keep draining the queue, but it cannot progress
-past the commit lock held by the writer. The writer cannot release that lock
-because its send is waiting for the worker. This is a **deadlock**: each side
-waits on something the other side controls. Moving the send after `applyTXSync`
-returns removes this particular cycle.
-
-The send may still block if compaction falls behind. That is **backpressure**:
-the rate of successful commit calls is constrained by the worker's ability to
-receive signals. DDIA describes the same broad choice for event streams: drop
-messages, buffer them, or make producers wait when the buffer is full. Here the
-bounded channel buffers some signals and then makes commit callers wait. This
-protects against an unlimited in-memory notification queue, but it can increase
-write latency. It does not impose an exact upper bound on WAL growth because
-buffer occupancy is not the same as log size, and a worker removes a signal
-*before* it completes the related compaction check.
-
-## `select`: wait for work or shutdown
-
-`select` lets one goroutine wait on several channel operations:
+A worker must respond to “new work” and “the database is closing.” Go's
+`select` waits for a channel operation that can proceed:
 
 ```go
 select {
-case kv.updated <- struct{}{}:
-    // A notification was queued or received.
-case <-kv.closing:
-    // Shutdown has begun; do not wait forever to send.
+case <-updated:
+    // Examine current storage state.
+case <-closing:
+    // Stop waiting for new work.
 }
 ```
 
-If no case can proceed, `select` waits. If several cases are ready, Go chooses
-one of the ready cases; source order does not give priority. Thus, once `closing`
-is closed, a send can still win if `updated` also has room. Correctness cannot
-depend on every pending signal being processed during shutdown.
+Closing `closing` makes every receive from it ready, so it broadcasts a
+shutdown signal. If both cases are ready, `select` chooses one ready case;
+source order gives no priority. Shutdown therefore does not promise that
+every queued notification is processed. Closing a channel also does not
+interrupt compaction already in progress.
 
-The worker uses the same two channels:
+The commit side can likewise select between sending a notification and
+observing shutdown. A commit then need not wait forever on a full channel
+after the worker has been told to stop. The signal channel stays open:
+closing it while goroutines may send would make those sends panic.
 
-```go
-for {
-    ok := false
-    select {
-    case _, ok = <-kv.updated:
-    case <-kv.closing:
-    }
-    if !ok {
-        break
-    }
-    if err := kv.Compact(); err != nil {
-        log.Println("KV.Compact():", err)
-    }
-}
-```
+## Telling work to stop versus waiting for it
 
-`updated` is never closed in this design, so receiving one of its signals sets
-`ok` to true. The `closing` receive leaves `ok` false and breaks the loop.
-Closing `closing` wakes *all* receivers waiting on it: the worker and commit
-callers blocked in their `select`. Unlike closing `updated`, this does not make
-senders panic, because nobody sends on `closing`.
-
-The worker may already be inside `Compact()` when shutdown begins. Closing a
-channel does not interrupt that function; it exits when it gets back to the
-`select` loop. Pending `updated` signals need not be drained before exit.
-
-## Shutdown: notification and waiting are separate
-
-The solution tracks the worker and top-level transactions with a `sync.WaitGroup`:
-
-```go
-// NewTX, after registering the transaction:
-kv.threads.Add(1)
-
-// On top-level commit or abort, after untracking:
-kv.threads.Add(-1)
-
-// Before starting the worker:
-kv.threads.Add(1)
-go func() {
-    defer kv.threads.Add(-1)
-    // receive signals and compact
-}()
-
-func (kv *KV) Close() error {
-    close(kv.closing)
-    kv.threads.Wait()
-    return kv.MultiClosers.Close()
-}
-```
-
-Think of the counter as the number of tracked activities that have not finished.
-`Wait()` blocks until it reaches zero. Thus the database files are closed only
-after the registered transactions and the worker have finished. The `closing`
-channel tells them to stop waiting for new work; the `WaitGroup` tells `Close`
-when they actually stopped. A channel close alone would not provide that wait.
-
-Example timeline:
+These are separate events:
 
 ```text
-worker:    receive signal ── Compact() ── see closing ── Done
-transaction:              finish commit ── select sees closing ── Done
-Close:              close(closing) ─────────────── Wait ── close files
+announce shutdown → worker notices → current action finishes → worker exits
 ```
 
-`Close()` can wait indefinitely if a caller begins a transaction and never
-commits or aborts it. This is a consequence of counting transaction lifetimes,
-not a channel malfunction.
-
-## What the locks protect during compaction
-
-The chapter revises the older compaction methods because they now overlap with
-transaction calls:
-
-1. `compactLog` takes `kv.commit` while it makes an SSTable from the MemTable,
-   updates metadata, and truncates the WAL. A concurrent transaction commit
-   cannot append to that WAL halfway through the flush. It briefly takes `kv.mu`
-   to publish the new SSTable and clear the current MemTable.
-2. `compactSSTable` builds a merged file, then briefly takes `kv.mu` to replace
-   two entries in `kv.main` with that file.
-3. `applyTXSync` also takes `kv.commit` for WAL commit order and `kv.mu` for
-   publication. The intended lock order when both are needed is
-   `kv.commit` → `kv.mu`.
-
-The long file work does not need to hold `kv.mu` in the intended design. That
-allows a transaction to capture a coherent snapshot while disk work continues.
-As DDIA explains, immutable old segments can remain useful to readers while a
-replacement is built. The moment the new SSTable list becomes visible needs
-coordination; the entire build need not freeze readers.
-
-## Where DDIA's message passing analogy ends
-
-DDIA's message brokers can buffer messages between separate processes and may
-offer persistence or redelivery, depending on the broker. A Go channel here has
-none of those properties. Its values live only in this process, and the worker
-does not acknowledge a notification after a durable action. The notification
-is best read as **“check the current state”**, not **“execute this specific job
-exactly once.”** The durable source of truth is the WAL and storage metadata.
-
-Likewise, DDIA's actor model processes messages through actor-owned state. This
-engine does not make all state private to the compaction worker: transactions and
-compaction still share `KV` fields and use mutexes. Channels and locks are
-complementary here.
-
-## Limits of the chapter's reference code
-
-These are useful boundaries when you later add more concurrency:
-
-- `Close()` does not prevent a new `NewTX()` after it starts. A concurrent positive
-  `WaitGroup.Add` while `Wait` is shutting down can violate the required lifecycle
-  ordering. A production design needs an admission state protected by a mutex:
-  reject new transactions once closing begins, then wait for those already
-  admitted. Repeated `Close()` also panics because it closes `closing` twice.
-- The worker may choose `closing` while `updated` still contains signals, so
-  `Close()` does not promise to finish every queued compaction request. That is
-  separate from waiting for a compaction already in progress.
-- A caller can invoke `Compact()` directly. The background worker is not an
-  exclusive gate for all compaction calls. Reads of `kv.mem` and `kv.main` in
-  `Compact()` and `compactSSTable()` deserve a full lock review before claiming
-  arbitrary concurrent manual compaction is race-free.
-- As noted in [0903](../0903/README.md), the conflict check scans `kv.history`
-  without `kv.mu` while abort cleanup may prune it. Adding channels does not
-  repair that pre-existing race.
-
-These limits do not obscure the main lesson: first identify the owner and
-lifetime of each shared resource, then check every interleaving where a
-goroutine can block, publish state, or stop.
-
-## Review questions
-
-1. Why is a `chan struct{}` enough to request compaction?
-2. What is the difference between a goroutine waiting on an empty channel and
-   repeatedly checking a boolean in a loop?
-3. In the deadlock example, which side holds `kv.commit`, and what does each
-   side need before it can continue?
-4. What does a full `updated` buffer do to commit latency? Why is that called
-   backpressure?
-5. Why does the worker check `kv.mem.Size()` rather than assume one signal
-   means one new SSTable?
-6. Why is `closing` closed but `updated` left open?
-7. Why does `Close()` need both `close(kv.closing)` and `kv.threads.Wait()`?
-8. If both `select` cases are ready, which wins? What does that mean for
-   queued compaction work?
-9. Which data is durable after a committed transaction: the channel signal,
-   the WAL entry, or both?
-10. What extra state would stop new transactions from entering while `Close()`
-    waits for the old ones?
-
-## Final mental model
+The database cannot close files at the first arrow if the worker or a
+transaction still uses them. A `sync.WaitGroup` counts active work:
+starting a tracked activity increments the count, finishing decrements it,
+and `Wait()` blocks until it reaches zero. The sample tracks the worker and
+top-level transaction lifetimes.
 
 ```text
-             sync.Mutex                    chan struct{}
-transactions ───────► committed state ───────► background worker
-     │                    │                        │
-     │                    │ WAL is durable         │ Compact reads current state
-     │                    └────────────────────────┘
-     │
-     └── tracked by WaitGroup ◄── worker also tracked
-                    ▲
-Close: close(closing) → Wait() → close storage files
+RUNNING → STOPPING → CLOSED
+            │           ▲
+            └─ wait for admitted work to finish
 ```
 
-Use the mutexes to make shared state coherent, the `updated` channel to wake
-the worker, the `closing` channel to announce shutdown, and the `WaitGroup` to
-know when registered work has actually ended.
+A complete lifecycle also stops **admitting** new work when shutdown begins.
+The 0904 sample does not enforce that boundary: `NewTX` can add work while
+`Close` waits. Its `Close()` also cannot safely be called twice because
+closing the same channel twice panics. A transaction that never commits or
+aborts can make shutdown wait forever. These are lifecycle limits of the
+sample, not general properties of channels.
+
+## How this relates to DDIA's message passing
+
+DDIA Chapter 4, printed pp. 132–134, describes message passing between
+processes through brokers. A sender and receiver can run at different
+speeds, with a queue between them. The differences matter:
+
+| Go channel in this engine | Message broker in DDIA |
+|---|---|
+| Connects goroutines in one process. | Typically connects processes or nodes. |
+| Values vanish when the process exits. | May store and redeliver messages, depending on design. |
+| A receive takes a queued value. | Delivery and acknowledgement rules vary. |
+| Carries a maintenance hint. | May carry durable events or commands. |
+
+DDIA also describes actors that own state and process messages one at a
+time. This engine is not entirely organized as actors: transactions and
+compaction share storage structures. They still need mutexes and careful
+publication rules. Sending on a channel does not automatically make shared
+memory safe.
+
+## Walk through one timeline
+
+Assume the MemTable is nearing its flush threshold:
+
+1. Transaction A commits. Its WAL record is durable and its new MemTable
+   version becomes visible. A sends a maintenance signal.
+2. The worker receives the signal, sees enough data to flush, and begins
+   writing a new SSTable. Old storage remains available while it builds.
+3. Transaction B starts during the file write. It must capture one coherent
+   committed view. It may see the old MemTable and SSTable list.
+4. The worker publishes the new SSTable as a coordinated state change.
+   Future transactions can see it; B keeps its earlier snapshot.
+5. A later signal may cause no compaction at all. Signals prompt a state
+   check rather than dictate a particular merge.
+
+At each step, ask: **What is durable? What is visible to new transactions?
+What could block, and what would unblock it?** These questions reveal most
+of the important concurrency issues.
+
+## The limits of the reference implementation
+
+The example illustrates a pattern; it does not prove every concurrent call
+is safe. A caller can invoke `Compact()` directly, and reads of shared
+`kv.mem` and `kv.main` need a full synchronization review under arbitrary
+concurrent use. The previous chapter's conflict-history read can also race
+with abort cleanup; see the [0903 notes](../0903/README.md).
+
+The reusable reasoning method is:
+
+1. Identify shared state and the invariant it must preserve.
+2. Decide which operations need exclusive access and which only need a signal.
+3. Draw the wait chain for every send, receive, lock, and shutdown wait.
+4. Separate durability of user data from delivery of background hints.
+5. Define when new work stops entering and when existing work has ended.
+
+## Reading map
+
+| Read | Focus |
+|---|---|
+| *Build Your Own Database From Scratch in Go*, 0904, printed pp. 99–103 | The concrete Go example and its deadlock and shutdown problems. |
+| DDIA, Chapter 3, printed pp. 71–76 | Why an LSM tree flushes and merges immutable files in the background. |
+| DDIA, Chapter 11, printed p. 427 | Buffering, dropping, and backpressure. |
+| DDIA, Chapter 4, printed pp. 132–134 | Message passing as a broader model. |
+
+Local books: [0904 book](/home/morgankim/Documents/ebooks/db_in_45_steps_go.pdf)
+and [DDIA](/home/morgankim/Documents/ebooks/Martin-Kleppmann---Designing-Data-Intensive-Applications_-O’Reilly-Media-(2017).pdf).
+The [0904 reference implementation](../db_solution/0904/kv.go) gives one
+concrete realization of these ideas.
+
+## Check your understanding
+
+1. Why can two goroutines interfere even on a single CPU core?
+2. Why is the notification channel unnecessary for WAL recovery?
+3. What is the difference between “received a signal” and “finished compaction”?
+4. When does a full channel create backpressure, and when can it help form a deadlock?
+5. Why can a channel wake the worker without protecting the SSTable list?
+6. Why must shutdown stop admitting work before waiting for active work to end?
+7. Which message-broker guarantees should you avoid assuming about a Go channel?
