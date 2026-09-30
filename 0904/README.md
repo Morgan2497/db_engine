@@ -275,26 +275,70 @@ The reusable reasoning method is:
 4. Separate durability of user data from delivery of background hints.
 5. Define when new work stops entering and when existing work has ended.
 
-## Reading map
+## Questions and answers
 
-| Read | Focus |
-|---|---|
-| *Build Your Own Database From Scratch in Go*, 0904, printed pp. 99–103 | The concrete Go example and its deadlock and shutdown problems. |
-| DDIA, Chapter 3, printed pp. 71–76 | Why an LSM tree flushes and merges immutable files in the background. |
-| DDIA, Chapter 11, printed p. 427 | Buffering, dropping, and backpressure. |
-| DDIA, Chapter 4, printed pp. 132–134 | Message passing as a broader model. |
+### Why can two goroutines interfere even on a single CPU core?
 
-Local books: [0904 book](/home/morgankim/Documents/ebooks/db_in_45_steps_go.pdf)
-and [DDIA](/home/morgankim/Documents/ebooks/Martin-Kleppmann---Designing-Data-Intensive-Applications_-O’Reilly-Media-(2017).pdf).
-The [0904 reference implementation](../db_solution/0904/kv.go) gives one
-concrete realization of these ideas.
+Only one goroutine executes on that core at an instant, but the scheduler can
+pause it between steps and run another. Suppose a transaction reads the old
+SSTable list, then compaction replaces the list before the transaction uses
+what it read. The operations overlap in *time*, even if their instructions
+never run simultaneously. A second core permits true simultaneous execution,
+but is not required for an unsafe interleaving.
 
-## Check your understanding
+### Why is the notification channel unnecessary for WAL recovery?
 
-1. Why can two goroutines interfere even on a single CPU core?
-2. Why is the notification channel unnecessary for WAL recovery?
-3. What is the difference between “received a signal” and “finished compaction”?
-4. When does a full channel create backpressure, and when can it help form a deadlock?
-5. Why can a channel wake the worker without protecting the SSTable list?
-6. Why must shutdown stop admitting work before waiting for active work to end?
-7. Which message-broker guarantees should you avoid assuming about a Go channel?
+The notification contains no user data; it only says “check whether
+compaction is needed.” Committed writes are recorded in the WAL. After a
+crash, the in-memory channel and MemTable disappear, but opening the database
+replays the WAL to rebuild recent state. If a notification is lost, a flush
+or merge may be delayed. It must not be needed to reconstruct a committed
+write. Once a flush is safely represented by an SSTable, the corresponding
+WAL records can be retired through the storage engine's normal procedure.
+
+### What is the difference between “received a signal” and “finished compaction”?
+
+Receiving removes one value from the channel and wakes the worker. The
+worker has not yet inspected the MemTable, written an SSTable, merged files,
+or published a new view. It may discover that no work is needed, encounter
+an error, or still be busy after the sender continues. Thus a free channel
+slot means **the signal was taken**, not **the storage work is complete**.
+
+### When does a full channel create backpressure, and when can it help form a deadlock?
+
+With a full buffered channel, another send waits until the worker receives
+a value. That is backpressure if the worker can keep running: it eventually
+frees a slot, and the sender continues. A deadlock can occur if the sender
+waits **while holding a lock the worker needs**. For example, a commit holds
+the WAL lock and waits to send, while the worker is trying to compact and
+waits for that same lock. Each needs the other to move first. Sending after
+releasing the WAL lock breaks this particular cycle.
+
+### Why can a channel wake the worker without protecting the SSTable list?
+
+Receiving a notification synchronizes communication of that value, but it
+does not give the worker exclusive ownership of every `KV` field. Other
+goroutines may still read or publish the SSTable list. The worker needs a
+separate rule, such as a mutex around publication and snapshot capture, so
+readers see one coherent list. A wake-up answers **when to check**; a lock
+answers **who may access or change shared state at the same time**.
+
+### Why must shutdown stop admitting work before waiting for active work to end?
+
+`Wait()` can safely tell us that all *already admitted* work has finished
+only if no new transaction can enter as the count approaches zero. Otherwise
+`Close()` may observe no active work and close files while a new transaction
+starts using them. A sound lifecycle first marks the database as stopping
+and rejects new starts, then waits for admitted transactions and the worker,
+then closes storage. The 0904 sample's `NewTX` does not enforce this admission
+boundary, so its shutdown sequence is not a complete concurrent-close design.
+
+### Which message-broker guarantees should you avoid assuming about a Go channel?
+
+Do not assume persistence across process crashes, delivery to another
+process, acknowledgement after work completes, automatic retry or redelivery,
+or exactly-once processing. A receive only takes a value from an in-memory
+channel. Real brokers differ in which guarantees they provide, too; those
+properties require explicit storage and delivery protocols. In this engine,
+the WAL provides durable user data and the channel provides a temporary
+maintenance hint.
